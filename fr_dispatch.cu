@@ -4,8 +4,8 @@
 #include "fr_ggml.cuh"
 #include "fr_kernels.h"
 
-// FlashRT kernels consumed directly from the flashrt-public csrc tree
-// (GGML_CUDA_FLASHRT_PUBLIC_DIR); no vendored copies.
+// FlashRT kernels come from vendor/csrc, vendored one-way from the FlashRT
+// repository (vendor/FLASHRT_VENDOR.txt pins the commit); never edited here.
 #include "gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_f32out_sm100.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_bias_f32b_f16out_sm100.cuh"

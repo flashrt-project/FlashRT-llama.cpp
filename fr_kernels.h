@@ -73,7 +73,7 @@ int quantize_weight_f16_padded(const void * w_f16, void * dst_packed, void * dst
                                int N, int K_src, int K_pad, cudaStream_t stream);
 
 // The SigLIP FFN GEMM pair and gemm_bias_f32out are declared in
-// flashrt-public's cutlass_fp4_gemm_siglip_ffn_f32out_sm100.cuh
+// vendor/csrc/gemm/fp4/cutlass_fp4_gemm_siglip_ffn_f32out_sm100.cuh
 // (namespace flash_rt::fp4).
 
 // Group-padded rows repack: n_groups groups widened group_in -> group_out
