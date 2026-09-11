@@ -1,0 +1,32 @@
+From e190b4433287f79f41535bf59a55c6c4d4554dd2 Mon Sep 17 00:00:00 2001
+From: LiangSu8899 <1342163629@qq.com>
+Date: Fri, 11 Sep 2026 14:09:26 -0400
+Subject: [PATCH 2/3] cuda: FlashRT adapter now lives at hosts/ggml in the
+ FlashRT checkout
+
+---
+ ggml/src/ggml-cuda/CMakeLists.txt | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 9eea257..70f67e9 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -128,12 +128,12 @@ if (CUDAToolkit_FOUND)
+     # translation unit is consumed from a FlashRT checkout (submodule-style),
+     # compiled inside this build tree like any other ggml-cuda source.
+     if (GGML_CUDA_FLASHRT_SM120)
+-        set(GGML_CUDA_FLASHRT_PUBLIC_DIR "" CACHE PATH "FlashRT checkout containing flash_rt/structures/adapters/ggml")
++        set(GGML_CUDA_FLASHRT_PUBLIC_DIR "" CACHE PATH "FlashRT checkout containing hosts/ggml")
+         if (NOT GGML_CUDA_FLASHRT_PUBLIC_DIR)
+             message(FATAL_ERROR "GGML_CUDA_FLASHRT_SM120 requires GGML_CUDA_FLASHRT_PUBLIC_DIR")
+         endif()
+         list(APPEND GGML_SOURCES_CUDA
+-            ${GGML_CUDA_FLASHRT_PUBLIC_DIR}/flash_rt/structures/adapters/ggml/fr_win_qwen36_sm120.cu
++            ${GGML_CUDA_FLASHRT_PUBLIC_DIR}/hosts/ggml/fr_win_qwen36_sm120.cu
+             ${GGML_CUDA_FLASHRT_PUBLIC_DIR}/csrc/quantize/f32_act_to_nvfp4_swizzled_mrows_sm120.cu
+             ${GGML_CUDA_FLASHRT_PUBLIC_DIR}/csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_f32out_sm120.cu)
+     endif()
+-- 
+2.43.0
+

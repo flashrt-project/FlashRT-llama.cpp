@@ -1,0 +1,81 @@
+From ab3d3dc5de3fcd4427f379009eb6092e835e627f Mon Sep 17 00:00:00 2001
+From: LiangSu8899 <1342163629@qq.com>
+Date: Fri, 11 Sep 2026 16:20:41 -0400
+Subject: [PATCH 3/3] cuda: consume the FlashRT-llama.cpp overlay at
+ ggml/src/ggml-cuda/flashrt
+
+The SM120 window translation unit and the two FlashRT kernels it needs
+come from the overlay checkout (submodule by default, GGML_CUDA_FLASHRT_DIR
+to override), which vendors the kernel sources and carries CUTLASS. The
+sm_120a pass is scoped to those three sources instead of a global
+CMAKE_CUDA_FLAGS gencode.
+---
+ ggml/src/ggml-cuda/CMakeLists.txt | 44 +++++++++++++++++++++++++------
+ 1 file changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 70f67e9..8a69c84 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -128,14 +128,36 @@ if (CUDAToolkit_FOUND)
+     # translation unit is consumed from a FlashRT checkout (submodule-style),
+     # compiled inside this build tree like any other ggml-cuda source.
+     if (GGML_CUDA_FLASHRT_SM120)
+-        set(GGML_CUDA_FLASHRT_PUBLIC_DIR "" CACHE PATH "FlashRT checkout containing hosts/ggml")
+-        if (NOT GGML_CUDA_FLASHRT_PUBLIC_DIR)
+-            message(FATAL_ERROR "GGML_CUDA_FLASHRT_SM120 requires GGML_CUDA_FLASHRT_PUBLIC_DIR")
++        # The window/matcher translation unit and the two FlashRT kernels it
++        # needs come from the FlashRT-llama.cpp overlay (default: submodule
++        # at flashrt/), which vendors the kernel sources under vendor/csrc
++        # and carries CUTLASS as its own submodule.
++        if (GGML_CUDA_FLASHRT_DIR)
++            set(FLASHRT_DIR "${GGML_CUDA_FLASHRT_DIR}")
++        else()
++            set(FLASHRT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flashrt")
+         endif()
+-        list(APPEND GGML_SOURCES_CUDA
+-            ${GGML_CUDA_FLASHRT_PUBLIC_DIR}/hosts/ggml/fr_win_qwen36_sm120.cu
+-            ${GGML_CUDA_FLASHRT_PUBLIC_DIR}/csrc/quantize/f32_act_to_nvfp4_swizzled_mrows_sm120.cu
+-            ${GGML_CUDA_FLASHRT_PUBLIC_DIR}/csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_f32out_sm120.cu)
++        if (NOT EXISTS "${FLASHRT_DIR}/vendor/csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_f32out_sm120.cu")
++            message(FATAL_ERROR "GGML_CUDA_FLASHRT_SM120: FlashRT-llama.cpp overlay not found at ${FLASHRT_DIR} (git submodule update --init --recursive, or set GGML_CUDA_FLASHRT_DIR)")
++        endif()
++        if (GGML_CUDA_FLASHRT_CUTLASS_DIR)
++            set(FLASHRT_CUTLASS_DIR "${GGML_CUDA_FLASHRT_CUTLASS_DIR}")
++        else()
++            set(FLASHRT_CUTLASS_DIR "${FLASHRT_DIR}/third_party/cutlass")
++        endif()
++        if (NOT EXISTS "${FLASHRT_CUTLASS_DIR}/include/cutlass/cutlass.h")
++            message(FATAL_ERROR "GGML_CUDA_FLASHRT_SM120: CUTLASS not found at ${FLASHRT_CUTLASS_DIR} (git submodule update --init --recursive in the overlay, or set GGML_CUDA_FLASHRT_CUTLASS_DIR)")
++        endif()
++        set(FLASHRT_SM120_SOURCES
++            ${FLASHRT_DIR}/fr_win_qwen36_sm120.cu
++            ${FLASHRT_DIR}/vendor/csrc/quantize/f32_act_to_nvfp4_swizzled_mrows_sm120.cu
++            ${FLASHRT_DIR}/vendor/csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_f32out_sm120.cu)
++        # The kernel bodies are guarded by __CUDA_ARCH_FEAT_SM120_ALL: they
++        # need the arch-specific sm_120a pass in addition to the build's own
++        # architecture list. Scoped to these three sources only.
++        set_source_files_properties(${FLASHRT_SM120_SOURCES} PROPERTIES
++            COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>")
++        list(APPEND GGML_SOURCES_CUDA ${FLASHRT_SM120_SOURCES})
+     endif()
+ 
+     ggml_add_backend_library(ggml-cuda
+@@ -145,7 +167,13 @@ if (CUDAToolkit_FOUND)
+ 
+     if (GGML_CUDA_FLASHRT_SM120)
+         add_compile_definitions(GGML_CUDA_FLASHRT_SM120)
+-        target_include_directories(ggml-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++        target_include_directories(ggml-cuda PRIVATE
++            ${CMAKE_CURRENT_SOURCE_DIR}
++            ${FLASHRT_DIR}
++            ${FLASHRT_DIR}/vendor/csrc
++            ${FLASHRT_CUTLASS_DIR}/include
++            ${FLASHRT_CUTLASS_DIR}/tools/util/include)
++        message(STATUS "GGML_CUDA_FLASHRT_SM120: enabled (overlay at ${FLASHRT_DIR}, CUTLASS at ${FLASHRT_CUTLASS_DIR})")
+     endif()
+ 
+     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+-- 
+2.43.0
+

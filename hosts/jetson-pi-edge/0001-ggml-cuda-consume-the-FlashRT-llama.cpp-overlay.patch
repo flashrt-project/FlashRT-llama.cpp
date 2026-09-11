@@ -1,0 +1,46 @@
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -135,22 +135,24 @@
+         # FlashRT NVFP4 tcgen05 kernels for Jetson AGX Thor (SM110). Compiled
+         # as a separate object library because they require -arch=sm_110a and
+         # CUTLASS headers, unlike the rest of ggml-cuda.
+-        # FlashRT kernel sources are consumed directly from a flashrt-public
+-        # checkout (default: submodule at flashrt/flashrt-public) instead of
+-        # vendored copies.
+-        if (GGML_CUDA_FLASHRT_PUBLIC_DIR)
+-            set(FLASHRT_PUBLIC_DIR "${GGML_CUDA_FLASHRT_PUBLIC_DIR}")
++        # The adapter and the FlashRT kernels it needs come from the
++        # FlashRT-llama.cpp overlay (default: submodule at flashrt/). The
++        # overlay vendors the kernel sources under vendor/csrc and carries
++        # CUTLASS as its own submodule.
++        if (GGML_CUDA_FLASHRT_DIR)
++            set(FLASHRT_DIR "${GGML_CUDA_FLASHRT_DIR}")
+         else()
+-            set(FLASHRT_PUBLIC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flashrt/flashrt-public")
++            set(FLASHRT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flashrt")
+         endif()
+-        if (NOT EXISTS "${FLASHRT_PUBLIC_DIR}/csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cu")
+-            message(FATAL_ERROR "GGML_CUDA_FLASHRT: flashrt-public not found at ${FLASHRT_PUBLIC_DIR} (set GGML_CUDA_FLASHRT_PUBLIC_DIR)")
++        if (NOT EXISTS "${FLASHRT_DIR}/vendor/csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cu")
++            message(FATAL_ERROR "GGML_CUDA_FLASHRT: FlashRT-llama.cpp overlay not found at ${FLASHRT_DIR} (git submodule update --init --recursive, or set GGML_CUDA_FLASHRT_DIR)")
+         endif()
++        set(FLASHRT_PUBLIC_DIR "${FLASHRT_DIR}/vendor")
+ 
+         if (GGML_CUDA_FLASHRT_CUTLASS_DIR)
+             set(FLASHRT_CUTLASS_DIR "${GGML_CUDA_FLASHRT_CUTLASS_DIR}")
+-        elseif (EXISTS "${FLASHRT_PUBLIC_DIR}/third_party/cutlass/include/cutlass/cutlass.h")
+-            set(FLASHRT_CUTLASS_DIR "${FLASHRT_PUBLIC_DIR}/third_party/cutlass")
++        elseif (EXISTS "${FLASHRT_DIR}/third_party/cutlass/include/cutlass/cutlass.h")
++            set(FLASHRT_CUTLASS_DIR "${FLASHRT_DIR}/third_party/cutlass")
+         else()
+             get_filename_component(FLASHRT_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../cutlass" ABSOLUTE)
+         endif()
+@@ -158,7 +160,7 @@
+             message(FATAL_ERROR "GGML_CUDA_FLASHRT: CUTLASS not found at ${FLASHRT_CUTLASS_DIR} (set GGML_CUDA_FLASHRT_CUTLASS_DIR)")
+         endif()
+ 
+-        set(FLASHRT_ADAPTER_DIR "${FLASHRT_PUBLIC_DIR}/flash_rt/structures/adapters/ggml")
++        set(FLASHRT_ADAPTER_DIR "${FLASHRT_DIR}")
+         if (NOT EXISTS "${FLASHRT_ADAPTER_DIR}/fr_dispatch.cu")
+             message(FATAL_ERROR "GGML_CUDA_FLASHRT: ggml adapter not found at ${FLASHRT_ADAPTER_DIR}")
+         endif()

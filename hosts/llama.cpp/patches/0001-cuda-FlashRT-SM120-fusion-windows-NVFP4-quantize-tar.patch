@@ -1,0 +1,536 @@
+From 0c9c002008c264c8e27775866f0ca5136a80357a Mon Sep 17 00:00:00 2001
+From: LiangSu8899 <1342163629@qq.com>
+Date: Fri, 11 Sep 2026 14:08:23 -0400
+Subject: [PATCH 1/3] cuda: FlashRT SM120 fusion windows, NVFP4 quantize
+ target, per-shape graph slots
+
+Host side of the FlashRT ggml adapter for the SM120 / Qwen3.6 target:
+
+- ggml-cuda: GGML_CUDA_FLASHRT_SM120 option compiles the adapter's window
+  translation unit and the two csrc kernels it needs from a FlashRT
+  checkout (GGML_CUDA_FLASHRT_PUBLIC_DIR). The fuse-hook call sites in
+  ggml-cuda.cu are compiled out unless the option is on.
+- llama-quantize: expose NVFP4 as a quantization target
+  (LLAMA_FTYPE_MOSTLY_NVFP4 -> GGML_TYPE_NVFP4).
+- llama-context: LLAMA_GRAPH_SLOTS=N keeps one reusable graph and
+  scheduler per (n_tokens, graph type, embd) shape so speculative decode
+  alternating 1-token draft and 4-token verify evals stops rebuilding
+  the graph every step. Default 1 preserves stock behaviour.
+- test-backend-ops: Qwen3-8B Q4_K_M M=1 GEMV worklist in the perf set.
+---
+ ggml/src/ggml-cuda/CMakeLists.txt | 19 +++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu   | 92 +++++++++++++++++++++++++++++++
+ src/llama-context.cpp             | 84 ++++++++++++++++++++++------
+ src/llama-context.h               | 22 ++++++++
+ src/llama-quant.cpp               |  1 +
+ tests/test-backend-ops.cpp        | 16 ++++++
+ tools/quantize/quantize.cpp       |  1 +
+ 7 files changed, 217 insertions(+), 18 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index d3953ee..9eea257 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -124,11 +124,30 @@ if (CUDAToolkit_FOUND)
+             template-instances/fattn-vec-instance-bf16-bf16.cu)
+     endif()
+ 
++    # FlashRT structures adapter, SM120/Qwen3.6 target: the window/matcher
++    # translation unit is consumed from a FlashRT checkout (submodule-style),
++    # compiled inside this build tree like any other ggml-cuda source.
++    if (GGML_CUDA_FLASHRT_SM120)
++        set(GGML_CUDA_FLASHRT_PUBLIC_DIR "" CACHE PATH "FlashRT checkout containing flash_rt/structures/adapters/ggml")
++        if (NOT GGML_CUDA_FLASHRT_PUBLIC_DIR)
++            message(FATAL_ERROR "GGML_CUDA_FLASHRT_SM120 requires GGML_CUDA_FLASHRT_PUBLIC_DIR")
++        endif()
++        list(APPEND GGML_SOURCES_CUDA
++            ${GGML_CUDA_FLASHRT_PUBLIC_DIR}/flash_rt/structures/adapters/ggml/fr_win_qwen36_sm120.cu
++            ${GGML_CUDA_FLASHRT_PUBLIC_DIR}/csrc/quantize/f32_act_to_nvfp4_swizzled_mrows_sm120.cu
++            ${GGML_CUDA_FLASHRT_PUBLIC_DIR}/csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_f32out_sm120.cu)
++    endif()
++
+     ggml_add_backend_library(ggml-cuda
+                              ${GGML_HEADERS_CUDA}
+                              ${GGML_SOURCES_CUDA}
+                             )
+ 
++    if (GGML_CUDA_FLASHRT_SM120)
++        add_compile_definitions(GGML_CUDA_FLASHRT_SM120)
++        target_include_directories(ggml-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++    endif()
++
+     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+ 
+     if (GGML_CUDA_GRAPHS)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b4c1281..022cf95 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1663,6 +1663,10 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+     }
+ }
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++bool ggml_cuda_frt_moe_blocks_fusion(const ggml_tensor * mm);
++#endif
++
+ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+                                           const ggml_tensor * ffn_gate,
+                                           const ggml_tensor * glu,
+@@ -1670,6 +1674,11 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+                                           const ggml_tensor * ffn_gate_bias = nullptr,
+                                           const ggml_tensor * ffn_up_scale = nullptr,
+                                           const ggml_tensor * ffn_gate_scale = nullptr) {
++#ifdef GGML_CUDA_FLASHRT_SM120
++    if (ggml_cuda_frt_moe_blocks_fusion(ffn_up) || ggml_cuda_frt_moe_blocks_fusion(ffn_gate)) {
++        return false;
++    }
++#endif
+     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
+     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
+ 
+@@ -1785,6 +1794,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+ }
+ 
+ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
++#ifdef GGML_CUDA_FLASHRT_SM120
++    if (ggml_cuda_frt_moe_blocks_fusion(tensor)) {
++        return false;
++    }
++#endif
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+@@ -1813,9 +1827,20 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     return use_mul_mat_vec_q;
+ }
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++bool ggml_cuda_frt_head_mul_mat(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
++#endif
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++    if (ggml_cuda_frt_head_mul_mat(ctx, src0, src1, dst)) {
++        return;
++    }
++#endif
++
+     const int32_t hint = ggml_get_op_params_i32(dst, 1);
+     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
+         return;
+@@ -1900,7 +1925,16 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+     return true;
+ }
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++bool ggml_cuda_frt_moe_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++#endif
++
+ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++#ifdef GGML_CUDA_FLASHRT_SM120
++    if (ggml_cuda_frt_moe_mul_mat_id(ctx, dst)) {
++        return;
++    }
++#endif
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+     const ggml_tensor * ids  = dst->src[2];
+@@ -3273,6 +3307,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+     return false;
+ }
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++bool ggml_cuda_frt_gdn_try_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count);
++bool ggml_cuda_frt_moeglue_try_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count);
++#endif
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -3281,6 +3320,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 0;
+     }
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++    {   // FlashRT GDN cell takeover (whole span -> 3 kernels)
++        int frt_skip = 0;
++        if (ggml_cuda_frt_gdn_try_impl(*cuda_ctx, cgraph, i, &frt_skip)) {
++            return frt_skip - 1;   // caller advances by (return + 1)
++        }
++        if (ggml_cuda_frt_moeglue_try_impl(*cuda_ctx, cgraph, i, &frt_skip)) {
++            return frt_skip - 1;
++        }
++    }
++#endif
++
+     ggml_tensor * node = cgraph->nodes[i];
+ 
+     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
+@@ -4040,6 +4091,39 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     };
+ 
+     while (!graph_evaluated_or_captured) {
++#ifdef GGML_CUDA_FLASHRT_SM120
++        {   // FRT_DUMP_GRAPH: one-shot node dump for region-boundary mapping
++            static int dump = -1;
++            if (dump < 0) { const char * d = getenv("FRT_DUMP_GRAPH"); dump = (d && d[0]=='1') ? 1 : 0; }
++            static int dump_m = -1;   // which token-batch width M to dump (default 1 = decode)
++            if (dump_m < 0) { const char * d = getenv("FRT_DUMP_M"); dump_m = d ? atoi(d) : 1; }
++            bool is_decode = false;
++            if (dump == 1 && cgraph->n_nodes > 200) {
++                for (int i = 0; i < cgraph->n_nodes && i < 200; ++i) {
++                    const ggml_tensor * n = cgraph->nodes[i];
++                    if (strncmp(n->name, "attn_norm", 9) == 0) { is_decode = (n->ne[1] == dump_m); break; }
++                }
++            }
++            if (dump == 1 && cgraph->n_nodes > 200 && is_decode) {
++                dump = 2;
++                FILE * f = fopen(getenv("FRT_DUMP_PATH") ? getenv("FRT_DUMP_PATH") : "/tmp/frt_graph_dump.txt", "w");
++                if (f) {
++                    for (int i = 0; i < cgraph->n_nodes; ++i) {
++                        const ggml_tensor * n = cgraph->nodes[i];
++                        fprintf(f, "%4d %-16s %-28s ne=[%lld,%lld,%lld,%lld]", i,
++                                ggml_op_name(n->op), n->name,
++                                (long long)n->ne[0],(long long)n->ne[1],(long long)n->ne[2],(long long)n->ne[3]);
++                        for (int s = 0; s < 3 && n->src[s]; ++s)
++                            fprintf(f, " src%d=%s[%lld,%lld,%lld]", s, n->src[s]->name,
++                                    (long long)n->src[s]->ne[0],(long long)n->src[s]->ne[1],(long long)n->src[s]->ne[2]);
++                        fprintf(f, "\n");
++                    }
++                    fclose(f);
++                    fprintf(stderr, "frt: graph dumped (%d nodes)\n", cgraph->n_nodes);
++                }
++            }
++        }
++#endif
+         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
+         // With the use of CUDA graphs, the execution will be performed by the graph launch.
+         if (!use_cuda_graph || cuda_graph_update_required) {
+@@ -4244,11 +4328,19 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+ }
+ #endif // USE_CUDA_GRAPH
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph);
++#endif
++
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++    ggml_cuda_frt_prepare(*cuda_ctx, cgraph);
++#endif
++
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0402044..867da48 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -603,6 +603,10 @@ void llama_context::sched_reserve() {
+ 
+     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+ 
++    if (const char * gs = getenv("LLAMA_GRAPH_SLOTS")) {
++        graph_slots_max = std::max(1, atoi(gs));
++    }
++
+     llama_memory_context_ptr mctx;
+     if (memory) {
+         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
+@@ -809,6 +813,9 @@ bool llama_context::memory_update(bool optimize) {
+         // TODO: change the mctx->apply() to return information if a graph reserve is needed
+         //       reset the graph result only if the memory module did reset the scheduler
+         gf_res_prev->reset();
++        // graph slots are NOT blanket-reset here: each slot owns its scheduler, so a
++        // memory-module update cannot invalidate its allocations; can_reuse() still
++        // re-validates every mctx-derived input before a slot graph is reused.
+ 
+         if (!mctx->apply()) {
+             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+@@ -1330,7 +1337,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     }
+ 
+     auto * res = gf_res_prev.get();
+-    auto * gf  = res->get_gf();
++
++    // route this eval to the graph slot owning its token-count shape, so that
++    // alternating shapes (spec decode: 1-token draft chain vs 4-token verify)
++    // each keep a live, reusable graph with stable allocations.
++    sched_active = nullptr;
++    if (graph_slots_max > 1) {
++        const bool has_embd = ubatch.embd != nullptr;
++        graph_slot * slot = nullptr;
++        for (auto & s : gf_slots) {
++            if (s.n_tokens == ubatch.n_tokens && s.gtype == (int) gtype && s.has_embd == has_embd) { slot = &s; break; }
++        }
++        if (!slot && (int) gf_slots.size() < graph_slots_max - 1) {
++            const size_t max_nodes = graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
++            gf_slots.push_back({});
++            slot = &gf_slots.back();
++            slot->n_tokens = ubatch.n_tokens;
++            slot->gtype    = (int) gtype;
++            slot->has_embd = has_embd;
++            slot->res.reset(new llm_graph_result(max_nodes));
++            slot->sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
++        }
++        if (slot) {
++            res = slot->res.get();
++            sched_active = slot->sched.get();
++        }
++        // shapes beyond the slot budget fall back to the shared gf_res_prev/sched
++    }
++
++    auto * gf = res->get_gf();
+ 
+     // the new graph parameters
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+@@ -1343,15 +1378,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+         // that the previous compute is still reading.
+         if (cparams.pipeline_parallel) {
+-            ggml_backend_sched_synchronize(sched.get());
++            ggml_backend_sched_synchronize(sched_cur());
+         }
+ 
+         n_reused++;
+     } else {
++        static const bool slots_dbg = getenv("LLAMA_GRAPH_SLOTS_DBG") != nullptr;
++        if (slots_dbg) {
++            fprintf(stderr, "graph-rebuild: ctx=%p n_tokens=%u gtype=%d embd=%d slot_sched=%p\n",
++                    (void *) this, ubatch.n_tokens, (int) gtype, ubatch.embd != nullptr, (void *) sched_active);
++        }
+         res->reset();
+ 
+-        ggml_backend_sched_reset(sched.get());
+-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++        ggml_backend_sched_reset(sched_cur());
++        ggml_backend_sched_set_eval_callback(sched_cur(), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
+@@ -1365,7 +1405,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
+-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
++        if (!ggml_backend_sched_alloc_graph(sched_cur(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+@@ -1479,7 +1519,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+ 
+     // extract logits
+     if (logits.data && t_logits) {
+-        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_cur(), t_logits);
+         GGML_ASSERT(backend_res != nullptr);
+         GGML_ASSERT(logits.data != nullptr);
+ 
+@@ -1488,7 +1528,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+ 
+     // extract embeddings
+     if (embd.data && t_embd) {
+-        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
++        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_cur(), t_embd);
+         GGML_ASSERT(backend_embd != nullptr);
+ 
+         switch (cparams.pooling_type) {
+@@ -1543,7 +1583,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+ 
+     // extract nextn embeddings (hidden state before the final output norm)
+     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+-        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
++        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_cur(), t_h_nextn);
+         GGML_ASSERT(backend_h != nullptr);
+ 
+         const uint32_t n_embd = hparams.n_embd_out();
+@@ -1861,7 +1901,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         // extract logits
+         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_cur(), t_logits);
+             GGML_ASSERT(backend_res != nullptr);
+             GGML_ASSERT(logits.data != nullptr);
+ 
+@@ -1876,7 +1916,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         // extract embeddings
+         if (embd.data && t_embd && n_outputs > 0) {
+-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
++            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_cur(), t_embd);
+             GGML_ASSERT(backend_embd != nullptr);
+ 
+             switch (cparams.pooling_type) {
+@@ -1944,7 +1984,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+ 
+             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
++                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_cur(), t_h_nextn);
+                 GGML_ASSERT(backend_h != nullptr);
+ 
+                 const uint32_t n_embd  = hparams.n_embd_out();
+@@ -1959,10 +1999,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             const auto stride = n_vocab;
+ 
+             // async copy the sampling data from the backend to the host
+-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
++            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched_cur());
++            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched_cur(), &sampling.logits_count);
++            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched_cur(), &sampling.probs_count);
++            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched_cur(), &sampling.candidates_count);
+         }
+ 
+         n_outputs_prev += n_outputs;
+@@ -2213,7 +2253,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
+         const size_t dst_offset = token_offset * row_floats;
+         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
+ 
+-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched_cur(), t);
+         GGML_ASSERT(backend != nullptr);
+         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+     }
+@@ -2406,10 +2446,16 @@ ggml_cgraph * llama_context::graph_reserve(
+         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+     }
+ 
++    sched_active = nullptr;   // reserve always runs on the main scheduler
++
+     ggml_backend_sched_reset(sched.get());
+ 
+     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
+     gf_res_prev->reset();
++    for (auto & s : gf_slots) {
++        ggml_backend_sched_reset(s.sched.get());
++        s.res->reset();
++    }
+ 
+     // store the n_outputs as it is, and restore it afterwards
+     // TODO: not sure if needed, might simplify in the future by removing this
+@@ -2459,7 +2505,7 @@ llm_graph_params llama_context::graph_params(
+         /*.cparams     =*/ cparams,
+         /*.ubatch      =*/ ubatch,
+         /*.gtype       =*/ gtype,
+-        /*.sched       =*/ sched.get(),
++        /*.sched       =*/ sched_cur(),
+         /*.backend_cpu =*/ backend_cpu,
+         /*.cvec        =*/ cvec.get(),
+         /*.loras       =*/ loras.get(),
+@@ -2491,7 +2537,7 @@ ggml_status llama_context::graph_compute(
+         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+     }
+ 
+-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
++    auto status = ggml_backend_sched_graph_compute_async(sched_cur(), gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+     }
+@@ -3409,6 +3455,8 @@ void llama_context::opt_epoch_iter(
+                 break;
+             }
+ 
++            sched_active = nullptr;   // training path always uses the main scheduler
++
+             auto * res = gf_res_prev.get();
+ 
+             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa..f4cff19 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -367,6 +367,28 @@ private:
+     llm_graph_result_ptr gf_res_prev;
+     llm_graph_result_ptr gf_res_reserve;
+ 
++    // per-shape graph slots (env: LLAMA_GRAPH_SLOTS, default 1 = single-slot
++    // behavior). speculative decode alternates draft-chain (n_tokens=1) and
++    // verify/h-extract (n_tokens=4) evals; with one prev-result slot every
++    // alternation rebuilds the ggml graph and reallocates the compute buffers
++    // (host-side ms per step, plus a CUDA-graph recapture). each slot owns its
++    // result AND its scheduler so one shape's allocation can never invalidate
++    // another shape's reusable graph.
++    struct graph_slot {
++        uint32_t               n_tokens = 0;
++        int                    gtype    = 0;
++        bool                   has_embd = false;
++        llm_graph_result_ptr   res;
++        ggml_backend_sched_ptr sched;
++    };
++    std::vector<graph_slot> gf_slots;
++    int graph_slots_max = 1;
++
++    // scheduler owning the graph of the eval in flight (null = main sched)
++    ggml_backend_sched_t sched_active = nullptr;
++
++    ggml_backend_sched_t sched_cur() const { return sched_active ? sched_active : sched.get(); }
++
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 2025281..b349ff2 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -821,6 +821,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
+         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
+ 
+         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
++        case LLAMA_FTYPE_MOSTLY_NVFP4: return GGML_TYPE_NVFP4;
+ 
+         // K-quants
+         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8e3b273..7bfc1dc 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10129,6 +10129,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // Qwen3-8B Q4_K_M decode (M=1) GEMV worklist: attn q/o, kv, ffn gate/up, ffn down, lm_head
++    {
++        struct { ggml_type t; int64_t m; int64_t k; } frt_cases[] = {
++            {GGML_TYPE_Q4_K,   4096,  4096}, // attn_q / attn_output
++            {GGML_TYPE_Q4_K,   1024,  4096}, // attn_k / attn_v (Q4_K half)
++            {GGML_TYPE_Q6_K,   1024,  4096}, // attn_v (Q6_K half)
++            {GGML_TYPE_Q4_K,  12288,  4096}, // ffn_gate / ffn_up
++            {GGML_TYPE_Q4_K,   4096, 12288}, // ffn_down (Q4_K half)
++            {GGML_TYPE_Q6_K,   4096, 12288}, // ffn_down (Q6_K half)
++            {GGML_TYPE_Q6_K, 151936,  4096}, // output head
++        };
++        for (auto & c : frt_cases) {
++            test_cases.emplace_back(new test_mul_mat(c.t, GGML_TYPE_F32, c.m, 1, c.k, {1, 1}, {1, 1}));
++        }
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+diff --git a/tools/quantize/quantize.cpp b/tools/quantize/quantize.cpp
+index 8d03c8f..d106c20 100644
+--- a/tools/quantize/quantize.cpp
++++ b/tools/quantize/quantize.cpp
+@@ -37,6 +37,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
+     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
+     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
+     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },
++    { "NVFP4",    LLAMA_FTYPE_MOSTLY_NVFP4,    " NVFP4 4.5 bpw (16-elem sub-block, UE4M3 scales)",  },
+     { "Q5_0",     LLAMA_FTYPE_MOSTLY_Q5_0,     " 5.21G, +0.1316 ppl @ Llama-3-8B",  },
+     { "Q5_1",     LLAMA_FTYPE_MOSTLY_Q5_1,     " 5.65G, +0.1062 ppl @ Llama-3-8B",  },
+     { "IQ2_XXS",  LLAMA_FTYPE_MOSTLY_IQ2_XXS,  " 2.06 bpw quantization",            },
+-- 
+2.43.0
+
