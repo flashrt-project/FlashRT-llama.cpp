@@ -187,236 +187,13 @@ static bool frt_amax_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
     return true;
 }
 
-// ---- exact replicas of the stock decode arithmetic ------------------------
-// The fused kernels below reproduce, value for value, what ggml-cuda computes
-// for the nodes they replace at M = 1:
-//   - quantize_q8_1: one warp per 32-element chunk, lane = element;
-//   - mul_mat_vec_q (NVFP4 x q8_1): the per-lane block assignment and the
-//     cross-warp / butterfly reduction order of the kernel variant ggml picks
-//     for the row length (K = 512, 1024, 2048), including the additions of the
-//     idle warps' zero partials;
-//   - the fused mmvq epilogue (scale, zero bias, SwiGLU), the MoE weighted
-//     reduction and the chained residual adds.
-// `fzero` is a runtime 0.0f so that x + 0 is never folded away (it maps -0 to
-// +0 exactly as the stock kernels' zero partials do).
-
-// stock quantize_q8_1 for one chunk: lane holds element `lane` of the chunk
-static __device__ __forceinline__ void frt_q8_1_chunk(const float xi, const int lane, block_q8_1 * dst) {
-    float amax = fabsf(xi);
-    float sum = xi;
-    amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
-    dst->qs[lane] = q;
-    if (lane == 0) {
-        dst->ds = make_half2(d, sum);
-    }
-}
-
-// mmvq row dot, NVFP4, K = 2048 (32 blocks): ggml launches 4 warps of which
-// warps 0/1 cover blocks [0,16) / [16,32) (one block per lane pair), then sums
-// warp partials 0+1+2+3 in order and reduces across the warp.
-static __device__ __forceinline__ float frt_rowdot_k2048(const void * row, const block_q8_1 * y, const int lane, const float fzero) {
-    const int kb = lane / 2, iqs = 4 * (lane % 2);
-    const float p0 = vec_dot_nvfp4_q8_1(row, y + 2 * kb,        kb,      iqs);
-    const float p1 = vec_dot_nvfp4_q8_1(row, y + 2 * (kb + 16), kb + 16, iqs);
-    float t = fzero + p0;
-    t += fzero + p1;
-    t += fzero;
-    t += fzero;
-    return warp_reduce_sum(t);
-}
-
-// K = 1024 (16 blocks): only warp 0 active, one block per lane pair.
-static __device__ __forceinline__ float frt_rowdot_k1024(const void * row, const block_q8_1 * y, const int lane, const float fzero) {
-    const int kb = lane / 2, iqs = 4 * (lane % 2);
-    float t = fzero + vec_dot_nvfp4_q8_1(row, y + 2 * kb, kb, iqs);
-    t += fzero;
-    t += fzero;
-    t += fzero;
-    return warp_reduce_sum(t);
-}
-
-// K = 512 (8 blocks): only lanes 0..15 of warp 0 active. Two independent rows
-// per warp: half h = lane/16 handles (row_h, y_h); the stock butterfly's first
-// step (xor 16) adds the idle half's +0, the rest stays within 16 lanes.
-static __device__ __forceinline__ float frt_rowdot_k512_pair(const void * row, const block_q8_1 * y, const int lane, const float fzero) {
-    const int l = lane % 16;
-    const int kb = l / 2, iqs = 4 * (l % 2);
-    float t = fzero + vec_dot_nvfp4_q8_1(row, y + 2 * kb, kb, iqs);
-    t += fzero;
-    t += fzero;
-    t += fzero;
-    t += fzero;   // xor-16 partner (idle lane) contributes +0
-    return warp_reduce_sum<16>(t);
-}
-
-// ---- MoE FFN span (FRT window MOEFFN) --------------------------------------
-// Replaces, for one decode token, everything after the router/top-k up to the
-// layer output: routed gate/up MUL_MAT_ID + scales + SwiGLU, the activation
-// rescale chain, routed down MUL_MAT_ID + scale, weighted expert sum, the
-// shared expert (gate, up, SwiGLU, down, scales) and both residual adds:
-// 14 stock launches -> 2.
-
-struct frt_moe_chain { float s1, b1, s2, b2, cmin, cmax, s3, b3; };
+// ---- graph-matching helpers -------------------------------------------------
 
 static constexpr int FRT_MOE_MAX_USED = 8;
 static constexpr int FRT_K_EMBD = 2048;
 
-// K1: one warp per GLU output; outputs [0, n_used*n_ff) routed, then n_ff_sh shared.
-template <int NW>
-static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_gu(
-        const float * act, const int32_t * ids,
-        const char * gate_w, const char * up_w, const size_t e_stride, const size_t row_stride,
-        const float * gate_sc, const float * up_sc,
-        const char * shg_w, const char * shu_w, const float * shg_sc, const float * shu_sc,
-        float * glu_out, const int n_used, const int n_ff, const int n_ff_sh, const float fzero) {
-    ggml_cuda_pdl_lc();
-    __shared__ block_q8_1 yq[FRT_K_EMBD / QK8_1];
-    __shared__ int sids[FRT_MOE_MAX_USED];
-    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
-    ggml_cuda_pdl_sync();
-    for (int c = warp; c < FRT_K_EMBD / QK8_1; c += NW) {
-        frt_q8_1_chunk(act[c * QK8_1 + lane], lane, &yq[c]);
-    }
-    if (threadIdx.x < n_used) {
-        sids[threadIdx.x] = ids[threadIdx.x];
-    }
-    __syncthreads();
-    const int o = blockIdx.x * NW + warp;
-    const int n_routed = n_used * n_ff;
-    if (o >= n_routed + n_ff_sh) {
-        return;
-    }
-    const char * gw; const char * uw; float gs, us;
-    const bool routed = o < n_routed;
-    if (routed) {
-        const int e = sids[o / n_ff];
-        const int r = o % n_ff;
-        gw = gate_w + (size_t) e * e_stride + (size_t) r * row_stride;
-        uw = up_w   + (size_t) e * e_stride + (size_t) r * row_stride;
-        gs = gate_sc[e];
-        us = up_sc[e];
-    } else {
-        const int r = o - n_routed;
-        gw = shg_w + (size_t) r * row_stride;
-        uw = shu_w + (size_t) r * row_stride;
-        gs = shg_sc[0];
-        us = shu_sc[0];
-    }
-    const float tg = frt_rowdot_k2048(gw, yq, lane, fzero);
-    const float tu = frt_rowdot_k2048(uw, yq, lane, fzero);
-    if (lane == 0) {
-        float res;
-        if (routed) {   // mmvq fused epilogue: x = up, gate = gate, SwiGLU
-            float result = tu;
-            result *= us;
-            result += fzero;
-            float gate_value = tg;
-            gate_value *= gs;
-            gate_value += fzero;
-            result *= ggml_cuda_op_silu_single(gate_value);
-            res = result;
-        } else {        // two scaled GEMVs, then the GLU kernel
-            float g = tg;
-            g *= gs;
-            g += fzero;
-            float u = tu;
-            u *= us;
-            u += fzero;
-            res = ggml_cuda_op_silu_single(g) * u;
-        }
-        glu_out[o] = res;
-    }
-}
 
-// K2: per-CTA prologue (activation rescale + q8_1 of all routed / shared GLU
-// rows into shared memory), then one warp per output row.
-template <int NW>
-static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_down(
-        const float * glu, const int32_t * ids, const float * wts,
-        const char * down_w, const size_t de_stride, const size_t drow_stride, const float * down_sc,
-        const char * shd_w, const size_t shd_row_stride, const float * shd_sc,
-        const float * resid, float * out, const frt_moe_chain ch,
-        const int n_used, const int n_ff, const int n_ff_sh, const int n_embd, const float fzero) {
-    ggml_cuda_pdl_lc();
-    __shared__ block_q8_1 yq_e[FRT_MOE_MAX_USED * 512 / QK8_1];
-    __shared__ block_q8_1 yq_s[1024 / QK8_1];
-    __shared__ float esc[FRT_MOE_MAX_USED];
-    __shared__ float sw[FRT_MOE_MAX_USED];
-    __shared__ int   sids[FRT_MOE_MAX_USED];
-    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
-    ggml_cuda_pdl_sync();
-    for (int s = warp; s < n_used; s += NW) {
-        float m = -FLT_MAX;
-        for (int j = lane; j < n_ff; j += WARP_SIZE) {
-            m = fmaxf(m, fabsf(glu[s * n_ff + j]));
-        }
-        m = warp_reduce_max(m);
-        if (lane == 0) {
-            float e = ch.s1 * m + ch.b1;
-            e = logf(e);
-            e = ch.s2 * e + ch.b2;
-            e = ceilf(e);
-            e = fminf(fmaxf(e, ch.cmin), ch.cmax);
-            e = ch.s3 * e + ch.b3;
-            e = expf(e);
-            esc[s] = e;
-            sids[s] = ids[s];
-            sw[s] = wts[s];
-        }
-    }
-    __syncthreads();
-    const int cpe = n_ff / QK8_1;
-    const int n_ce = n_used * cpe;
-    for (int c = warp; c < n_ce + n_ff_sh / QK8_1; c += NW) {
-        if (c < n_ce) {
-            const float x = glu[c * QK8_1 + lane] / esc[c / cpe];
-            frt_q8_1_chunk(x, lane, &yq_e[c]);
-        } else {
-            const int cs = c - n_ce;
-            frt_q8_1_chunk(glu[n_used * n_ff + cs * QK8_1 + lane], lane, &yq_s[cs]);
-        }
-    }
-    __syncthreads();
-    const int row = blockIdx.x * NW + warp;
-    if (row >= n_embd) {
-        return;
-    }
-    float de[FRT_MOE_MAX_USED];
-#pragma unroll
-    for (int p = 0; p < FRT_MOE_MAX_USED / 2; ++p) {
-        if (2 * p < n_used) {
-            const int slot = 2 * p + lane / 16;   // n_used is even (checked by the predicate)
-            const char * rp = down_w + (size_t) sids[slot] * de_stride + (size_t) row * drow_stride;
-            const float t = frt_rowdot_k512_pair(rp, yq_e + slot * cpe, lane, fzero);
-            de[2 * p]     = __shfl_sync(0xffffffff, t, 0);
-            de[2 * p + 1] = __shfl_sync(0xffffffff, t, 16);
-        }
-    }
-    const float tsh = frt_rowdot_k1024(shd_w + (size_t) row * shd_row_stride, yq_s, lane, fzero);
-    if (lane == 0) {
-        float sum = 0.0f;
-        for (int s = 0; s < n_used; ++s) {
-            float r = de[s];          // mmvq epilogue: per-expert scale, zero bias
-            r *= down_sc[sids[s]];
-            r += fzero;
-            if (s == 0) {
-                sum = (r * esc[0]) * sw[0];
-            } else {
-                sum += (r * esc[s]) * sw[s];
-            }
-        }
-        float sh = tsh;
-        sh *= shd_sc[0];
-        sh += fzero;
-        float result = sum;           // k_bin_bcast with two fused addends
-        result = result + sh;
-        result = result + resid[row];
-        out[row] = result;
-    }
-}
+static bool frt_aligned16(const void * p) { return ((uintptr_t) p & 15) == 0; }
 
 // scale tensor behind the GET_ROWS(REPEAT(RESHAPE(scale)), ids) chain of a
 // scaled MUL_MAT_ID, or nullptr when the chain does not match.
@@ -457,6 +234,757 @@ static bool frt_span_closed(const ggml_cgraph * cgraph, int a, int b, const ggml
         if (ggml_node_get_use_count(cgraph, j) != refs) return false;
     }
     return true;
+}
+
+// ---- exact replicas of the stock decode arithmetic ------------------------
+// The fused kernels below reproduce, value for value, what ggml-cuda computes
+// for the nodes they replace at M = 1:
+//   - quantize_q8_1: one warp per 32-element chunk, lane = element;
+//   - mul_mat_vec_q (NVFP4 x q8_1): the per-lane block assignment and the
+//     cross-warp / butterfly reduction order of the kernel variant ggml picks
+//     for the row length (K = 512, 1024, 2048), including the additions of the
+//     idle warps' zero partials;
+//   - the fused mmvq epilogue (scale, zero bias, SwiGLU), the MoE weighted
+//     reduction and the chained residual adds.
+// `fzero` is a runtime 0.0f so that x + 0 is never folded away (it maps -0 to
+// +0 exactly as the stock kernels' zero partials do).
+
+// stock quantize_q8_1 for one chunk: lane holds element `lane` of the chunk
+static __device__ __forceinline__ void frt_q8_1_chunk(const float xi, const int lane, block_q8_1 * dst) {
+    float amax = fabsf(xi);
+    float sum = xi;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    dst->qs[lane] = q;
+    if (lane == 0) {
+        dst->ds = make_half2(d, sum);
+    }
+}
+
+// One lane's share of an NVFP4 block under the mmvq lane mapping (iqs = 0 or
+// 4): the four qs ints and the two sub-block scale bytes vec_dot_nvfp4_q8_1
+// reads. Weights are immutable, so kernels fetch these before the PDL
+// dependency wait and before their activation prologue.
+struct frt_nvb { int q0, q1, q2, q3; uint32_t d; };
+
+static __device__ __forceinline__ frt_nvb frt_ld_nvb(const char * row, const int kb, const int iqs) {
+    const char * blk = row + (size_t) kb * sizeof(block_nvfp4);
+    const int * qs = (const int *) (blk + offsetof(block_nvfp4, qs)) + iqs;
+    frt_nvb r;
+    r.q0 = qs[0];
+    r.q1 = qs[1];
+    r.q2 = qs[2];
+    r.q3 = qs[3];
+    r.d  = *(const uint16_t *) (blk + offsetof(block_nvfp4, d) + iqs / 2);
+    return r;
+}
+
+// vec_dot_nvfp4_q8_1 over a preloaded block share; y = q8_1 blocks of this
+// NVFP4 block (2 x 32 values). Same operations in the same order.
+static __device__ __forceinline__ float frt_vd(const frt_nvb & b, const block_q8_1 * y, const int iqs) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < VDR_NVFP4_Q8_1_MMVQ/2; i++) {
+        const int32_t iqs0 = iqs + 2*i;
+        const int32_t is = iqs0 >> 1;
+        const int2 v0 = get_int_from_table_16(i == 0 ? b.q0 : b.q2, kvalues_mxfp4);
+        const int2 v1 = get_int_from_table_16(i == 0 ? b.q1 : b.q3, kvalues_mxfp4);
+        const block_q8_1 * bq8 = y + (is >> 1);
+        const int32_t i8 = ((is & 1) << 2);
+
+        int sumi = ggml_cuda_dp4a(v0.x, get_int_b4(bq8->qs, i8 + 0), 0);
+        sumi = ggml_cuda_dp4a(v0.y, get_int_b4(bq8->qs, i8 + 2), sumi);
+        sumi = ggml_cuda_dp4a(v1.x, get_int_b4(bq8->qs, i8 + 1), sumi);
+        sumi = ggml_cuda_dp4a(v1.y, get_int_b4(bq8->qs, i8 + 3), sumi);
+
+        const float d = ggml_cuda_ue4m3_to_fp32((uint8_t) (b.d >> (8*i))) * __low2float(bq8->ds);
+        sum += d * float(sumi);
+    }
+    return sum;
+}
+
+static __device__ __forceinline__ int frt_lane_iqs(const int lane) { return 4 * (lane % 2); }
+
+// mmvq row dot, NVFP4, K = 2048 (32 blocks): ggml launches 4 warps of which
+// warps 0/1 cover blocks [0,16) / [16,32) (one block per lane pair), then sums
+// warp partials 0+1+2+3 in order and reduces across the warp.
+// b[w] = this lane's share of block lane/2 + 16 w.
+static __device__ __forceinline__ float frt_rowdot_k2048(const frt_nvb (&b)[2], const block_q8_1 * y, const int lane, const float fzero) {
+    const int kb = lane / 2, iqs = frt_lane_iqs(lane);
+    const float p0 = frt_vd(b[0], y + 2 * kb,        iqs);
+    const float p1 = frt_vd(b[1], y + 2 * (kb + 16), iqs);
+    float t = fzero + p0;
+    t += fzero + p1;
+    t += fzero;
+    t += fzero;
+    return warp_reduce_sum(t);
+}
+
+// K = 1024 (16 blocks): only warp 0 active, one block per lane pair.
+static __device__ __forceinline__ float frt_rowdot_k1024(const frt_nvb & b, const block_q8_1 * y, const int lane, const float fzero) {
+    const int kb = lane / 2, iqs = frt_lane_iqs(lane);
+    float t = fzero + frt_vd(b, y + 2 * kb, iqs);
+    t += fzero;
+    t += fzero;
+    t += fzero;
+    return warp_reduce_sum(t);
+}
+
+// K = 512 (8 blocks): only lanes 0..15 of warp 0 active. Two independent rows
+// per warp: half h = lane/16 handles its own (row, y); the stock butterfly's
+// first step (xor 16) adds the idle half's +0, the rest stays within 16 lanes.
+// b = this lane's share of block (lane % 16) / 2 of its half's row.
+static __device__ __forceinline__ float frt_rowdot_k512_pair(const frt_nvb & b, const block_q8_1 * y, const int lane, const float fzero) {
+    const int kb = (lane % 16) / 2, iqs = frt_lane_iqs(lane);
+    float t = fzero + frt_vd(b, y + 2 * kb, iqs);
+    t += fzero;
+    t += fzero;
+    t += fzero;
+    t += fzero;   // xor-16 partner (idle lane) contributes +0
+    return warp_reduce_sum<16>(t);
+}
+
+// K = 4096 (64 blocks): 4 warps, one block per lane pair each; the warp
+// partials are summed in warp order before the butterfly.
+static __device__ __forceinline__ float frt_rowdot_k4096(const frt_nvb (&b)[4], const block_q8_1 * y, const int lane, const float fzero) {
+    const int kb = lane / 2, iqs = frt_lane_iqs(lane);
+    float p[4];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        p[w] = fzero + frt_vd(b[w], y + 2 * (kb + 16 * w), iqs);
+    }
+    float t = p[0];
+    t += p[1];
+    t += p[2];
+    t += p[3];
+    return warp_reduce_sum(t);
+}
+
+// warp-cooperative L2 prefetch of [p, p + nbytes): no registers held
+static __device__ __forceinline__ void frt_l2_prefetch(const char * p, const size_t nbytes, const int lane) {
+    const uintptr_t lo = (uintptr_t) p & ~(uintptr_t) 127;
+    const uintptr_t hi = (uintptr_t) p + nbytes;
+    for (uintptr_t a = lo + (uintptr_t) lane * 128; a < hi; a += 32 * 128) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(a));
+    }
+}
+
+template <int NB>
+static __device__ __forceinline__ void frt_ld_row(frt_nvb (&b)[NB], const char * row, const int lane) {
+#pragma unroll
+    for (int w = 0; w < NB; ++w) {
+        b[w] = frt_ld_nvb(row, lane / 2 + 16 * w, frt_lane_iqs(lane));
+    }
+}
+
+// Stock rms_norm_f32<512, 1, vec, mul> over one 2048-wide row, reproduced by
+// NW warps of one CTA: virtual thread v (0..511) owns float4 v; virtual warp
+// partial sums are reduced exactly as block_reduce does. Writes the
+// normalized, weighted row to `out` (shared memory).
+template <int NW>
+static __device__ __forceinline__ void frt_rms_norm_2048(const float * x, const float * w, const float eps,
+        float * out, float * red, const int ncols) {
+    static_assert(512 % (NW * WARP_SIZE) == 0, "virtual block of 512 threads");
+    constexpr int VPT = 512 / (NW * WARP_SIZE);   // virtual threads per real thread
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const float4 * x4 = (const float4 *) x;
+    float4 xs[VPT];
+#pragma unroll
+    for (int k = 0; k < VPT; ++k) {
+        const int v = threadIdx.x + k * NW * WARP_SIZE;   // virtual thread id
+        float4 xv[1];
+        float tmp = 0.0f;
+        xv[0] = x4[v];
+        tmp += xv[0].x*xv[0].x + xv[0].y*xv[0].y + xv[0].z*xv[0].z + xv[0].w*xv[0].w;
+        tmp = warp_reduce_sum(tmp);
+        if (lane == 0) red[v / WARP_SIZE] = tmp;
+        xs[k] = xv[0];
+    }
+    __syncthreads();
+    float tot = lane < 512 / WARP_SIZE ? red[lane] : 0.0f;
+    tot = warp_reduce_sum(tot);
+    const float scale = rsqrtf(tot / ncols + eps);
+    const float4 * w4 = (const float4 *) w;
+    float4 * o4 = (float4 *) out;
+#pragma unroll
+    for (int k = 0; k < VPT; ++k) {
+        const int v = threadIdx.x + k * NW * WARP_SIZE;
+        float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+        const float4 m = w4[v];
+        r.x *= m.x;
+        r.y *= m.y;
+        r.z *= m.z;
+        r.w *= m.w;
+        o4[v] = r;
+    }
+    GGML_UNUSED(warp);
+}
+
+// ---- attention front (FRT window ATTNQKV) -----------------------------------
+// attn RMSNorm -> q8_1 -> Q/K/V GEMV (+ per-tensor scales) -> per-head
+// RMSNorm * q/k_norm (+ NEOX RoPE on rope layers) -> Q (f32) for the
+// attention, K/V rows (f16) into the cache: 11 stock launches -> 2.
+
+struct frt_rope_params {
+    int   n_dims;
+    float freq_scale, ext_factor, attn_factor, theta_scale;
+    float corr0, corr1;
+};
+
+static constexpr int FRT_QKV_ROWS_MAX = 4096 + 2 * 512;
+
+// K_qkv: one warp per output row; rows [0,nq) Q, [nq,nq+nk) K, then V.
+template <int NW>
+static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_attn_qkv(
+        const float * x, const float * norm_w, const float eps,
+        const char * wq, const char * wk, const char * wv, const size_t row_stride,
+        const float * sq, const float * sk, const float * sv,
+        float * out, const int nq, const int nk, const float fzero, const int ncols) {
+    ggml_cuda_pdl_lc();
+    __shared__ float xn[FRT_K_EMBD];
+    __shared__ float red[32];
+    __shared__ block_q8_1 yq[FRT_K_EMBD / QK8_1];
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int r = blockIdx.x * NW + warp;
+    const bool active = r < nq + 2 * nk;
+    frt_nvb b[2];
+    float s = 0.0f;
+    if (active) {   // weights and scales are immutable: fetch before the dependency wait
+        const char * w;
+        if (r < nq)           { w = wq + (size_t) r * row_stride;               s = sq[0]; }
+        else if (r < nq + nk) { w = wk + (size_t) (r - nq) * row_stride;        s = sk[0]; }
+        else                  { w = wv + (size_t) (r - nq - nk) * row_stride;   s = sv[0]; }
+        frt_ld_row<2>(b, w, lane);
+    }
+    ggml_cuda_pdl_sync();
+    frt_rms_norm_2048<NW>(x, norm_w, eps, xn, red, ncols);
+    __syncthreads();
+    for (int c = warp; c < FRT_K_EMBD / QK8_1; c += NW) {
+        frt_q8_1_chunk(xn[c * QK8_1 + lane], lane, &yq[c]);
+    }
+    __syncthreads();
+    if (!active) {
+        return;
+    }
+    const float t = frt_rowdot_k2048(b, yq, lane, fzero);
+    if (lane == 0) {
+        float result = t;
+        result *= s;
+        result += fzero;
+        out[r] = result;
+    }
+}
+
+// K_qkn: one warp per head. Q heads [0,hq), K heads [hq,hq+hk), V heads after.
+// rope=false: stock rms_norm_f32<32,1,vec,mul> (one warp per 128-wide row);
+// rope=true:  stock rms_norm_mul_rope_f32<256> (8 warps, 4 of them loaded),
+// NEOX pairs (i, i + n_dims/2), f32 out; K and V rows go to the cache as f16.
+template <bool rope>
+static __global__ void frt_attn_qkn(
+        const float * qkv, const float * qn_w, const float * kn_w, const float eps,
+        float * q_out, half * k_cache, half * v_cache, const int64_t * k_idx, const int64_t * v_idx,
+        const size_t k_row_bytes, const size_t v_row_bytes,
+        const int hq, const int hk, const int32_t * pos, const frt_rope_params rp, const int ncols) {
+    ggml_cuda_pdl_lc();
+    constexpr int D = 128;
+    const int h = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (h >= hq + 2 * hk) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    const bool is_v = h >= hq + hk;
+    const bool is_k = !is_v && h >= hq;
+    const float * xc = qkv + (size_t) h * D;
+    if (is_v) {   // set_rows f32 -> f16 of the scaled V head
+        half * dst = (half *) ((char *) v_cache + (size_t) v_idx[0] * v_row_bytes) + (size_t) (h - hq - hk) * D;
+#pragma unroll
+        for (int k = 0; k < D / WARP_SIZE; ++k) {
+            dst[lane + k * WARP_SIZE] = __float2half(xc[lane + k * WARP_SIZE]);
+        }
+        return;
+    }
+    const float * mulc = is_k ? kn_w : qn_w;
+    float out[4];
+    int   oix[4];
+    if constexpr (!rope) {
+        const float4 * x4 = (const float4 *) xc;
+        float4 xs[1];
+        float tmp = 0.0f;
+        xs[0] = x4[lane];
+        tmp += xs[0].x*xs[0].x + xs[0].y*xs[0].y + xs[0].z*xs[0].z + xs[0].w*xs[0].w;
+        tmp = warp_reduce_sum(tmp);
+        const float scale = rsqrtf(tmp / ncols + eps);
+        float4 r = make_float4(scale*xs[0].x, scale*xs[0].y, scale*xs[0].z, scale*xs[0].w);
+        const float4 m = ((const float4 *) mulc)[lane];
+        r.x *= m.x;
+        r.y *= m.y;
+        r.z *= m.z;
+        r.w *= m.w;
+        out[0] = r.x; out[1] = r.y; out[2] = r.z; out[3] = r.w;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) oix[k] = 4 * lane + k;
+    } else {
+        // 256 virtual threads: v < 128 holds element v, virtual warps 4..7 hold
+        // 0; block_reduce then sums the 8 warp partials (+ zero sentinels).
+        float s4[4];
+#pragma unroll
+        for (int wv = 0; wv < 4; ++wv) {
+            const float xi = xc[wv * WARP_SIZE + lane];
+            float tmp = 0.0f;
+            tmp += xi * xi;
+            s4[wv] = warp_reduce_sum(tmp);
+        }
+        float tot = 0.0f;
+        if (lane == 0) tot = s4[0];
+        else if (lane == 1) tot = s4[1];
+        else if (lane == 2) tot = s4[2];
+        else if (lane == 3) tot = s4[3];
+        tot = warp_reduce_sum(tot);
+        const float scale = rsqrtf(tot/ncols + eps);
+        // pairs i0 = 2*v for virtual v < 64: lane covers v = lane and v = lane + 32
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int v  = lane + k * WARP_SIZE;
+            const int i0 = 2 * v;
+            const int ix0 = i0 / 2;
+            const int ix1 = i0 / 2 + rp.n_dims / 2;
+            const float x0 = scale * xc[ix0] * mulc[ix0];
+            const float x1 = scale * xc[ix1] * mulc[ix1];
+            const float theta_base  = pos[0]*powf(rp.theta_scale, i0/2.0f);
+            const float freq_factor = 1.0f;
+            float cos_theta;
+            float sin_theta;
+            {   // rope_yarn<true>
+                const float theta_extrap = theta_base/freq_factor;
+                float mscale = rp.attn_factor;
+                float theta_interp = rp.freq_scale * theta_extrap;
+                float theta = theta_interp;
+                if (rp.ext_factor != 0.0f) {
+                    const float y = (i0 / 2 - rp.corr0) / max(0.001f, rp.corr1 - rp.corr0);
+                    const float ramp_mix = (1.0f - min(1.0f, max(0.0f, y))) * rp.ext_factor;
+                    theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+                    mscale *= 1.0f + 0.1f * logf(1.0f / rp.freq_scale);
+                }
+                cos_theta = cosf(theta) * mscale;
+                sin_theta = sinf(theta) * mscale;
+            }
+            out[2 * k]     = x0*cos_theta - x1*sin_theta;
+            out[2 * k + 1] = x0*sin_theta + x1*cos_theta;
+            oix[2 * k]     = ix0;
+            oix[2 * k + 1] = ix1;
+        }
+    }
+    if (is_k) {
+        half * dst = (half *) ((char *) k_cache + (size_t) k_idx[0] * k_row_bytes) + (size_t) (h - hq) * D;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) dst[oix[k]] = __float2half(out[k]);
+    } else {
+        float * dst = q_out + (size_t) h * D;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) dst[oix[k]] = out[k];
+    }
+}
+
+static float * g_qkv = nullptr;
+
+// matches MUL_MAT(w, x) -> MUL(s) -> RESHAPE [128, h] -> RMS_NORM -> MUL(norm_w) [-> ROPE]
+struct frt_head_chain {
+    const ggml_tensor * mm = nullptr, * smul = nullptr, * norm = nullptr, * nmul = nullptr, * rope = nullptr;
+    const ggml_tensor * last() const { return rope ? rope : nmul; }
+};
+
+static bool frt_rope_params_of(const ggml_tensor * rope, frt_rope_params & rp) {
+    const int32_t * op = (const int32_t *) rope->op_params;
+    const int n_dims = op[1], mode = op[2], n_ctx_orig = op[4];
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base,   op +  5, sizeof(float));
+    memcpy(&freq_scale,  op +  6, sizeof(float));
+    memcpy(&ext_factor,  op +  7, sizeof(float));
+    memcpy(&attn_factor, op +  8, sizeof(float));
+    memcpy(&beta_fast,   op +  9, sizeof(float));
+    memcpy(&beta_slow,   op + 10, sizeof(float));
+    if (!(mode & GGML_ROPE_TYPE_NEOX) || n_dims != 128 || rope->src[2] != nullptr) return false;
+    float corr[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr);
+    rp = { n_dims, freq_scale, ext_factor, attn_factor, powf(freq_base, -2.0f/n_dims), corr[0], corr[1] };
+    return true;
+}
+
+// anchor: RMS_NORM over the residual stream followed by MUL(attn_norm.weight).
+static bool frt_attnqkv_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
+    static const bool on = frt_window_on("GGML_FLASHRT_NO_ATTNQKV");
+    if (!on || g_qkv == nullptr) return false;
+    const ggml_tensor * rn = cgraph->nodes[i];
+    if (rn->op != GGML_OP_RMS_NORM || i + 1 >= cgraph->n_nodes) return false;
+    const ggml_tensor * an = cgraph->nodes[i + 1];
+    if (an->op != GGML_OP_MUL || an->src[0] != rn || !strstr(an->src[1]->name, ".attn_norm.weight")) return false;
+    const ggml_tensor * x = rn->src[0];
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || ggml_nrows(x) != 1 || !ggml_is_contiguous(x)) return false;
+    const ggml_tensor * nw = an->src[1];
+    if (nw->type != GGML_TYPE_F32 || nw->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(nw)) return false;
+    if (!frt_aligned16(x->data) || !frt_aligned16(nw->data)) return false;
+    float eps; memcpy(&eps, rn->op_params, sizeof(float));
+
+    frt_head_chain q, k;
+    const ggml_tensor * vmm = nullptr, * vmul = nullptr;
+    ggml_tensor * k_set = nullptr, * v_set = nullptr;
+    int end = -1;
+    frt_head_chain * cur = nullptr;
+    const int LIM = std::min(cgraph->n_nodes, i + 32);
+    for (int j = i + 2; j < LIM && end < 0; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        switch (n->op) {
+            case GGML_OP_RESHAPE: case GGML_OP_VIEW:
+                break;
+            case GGML_OP_MUL_MAT:
+                if (n->src[1] != an) return false;
+                if (strstr(n->src[0]->name, ".attn_q.weight") && !q.mm) { q.mm = n; cur = &q; }
+                else if (strstr(n->src[0]->name, ".attn_k.weight") && !k.mm) { k.mm = n; cur = &k; }
+                else if (strstr(n->src[0]->name, ".attn_v.weight") && !vmm) { vmm = n; cur = nullptr; }
+                else return false;
+                break;
+            case GGML_OP_MUL:
+                if (vmm && !vmul && n->src[0] == vmm) { vmul = n; break; }
+                if (!cur) return false;
+                if (!cur->smul && n->src[0] == cur->mm) { cur->smul = n; break; }
+                if (cur->norm && !cur->nmul && n->src[0] == cur->norm) { cur->nmul = n; break; }
+                return false;
+            case GGML_OP_RMS_NORM:
+                if (!cur || !cur->smul || cur->norm || n->src[0]->op != GGML_OP_RESHAPE || n->src[0]->src[0] != cur->smul) return false;
+                cur->norm = n;
+                break;
+            case GGML_OP_ROPE:
+                if (!cur || !cur->nmul || cur->rope || n->src[0] != cur->nmul) return false;
+                cur->rope = n;
+                break;
+            case GGML_OP_SET_ROWS:
+                if (!k_set) k_set = n;
+                else { v_set = n; end = j; }
+                break;
+            default:
+                return false;
+        }
+    }
+    if (end < 0 || !q.mm || !q.smul || !q.norm || !q.nmul || !k.mm || !k.smul || !k.norm || !k.nmul || !vmm || !vmul) return false;
+    const bool rope = q.rope != nullptr;
+    if ((k.rope != nullptr) != rope) return false;
+    // weights / scales
+    const ggml_tensor * wq = q.mm->src[0], * wk = k.mm->src[0], * wv = vmm->src[0];
+    for (const ggml_tensor * w : { wq, wk, wv }) {
+        if (w->type != GGML_TYPE_NVFP4 || w->ne[0] != FRT_K_EMBD || w->nb[1] != wq->nb[1] || !ggml_is_contiguous(w)) return false;
+    }
+    const int nq = (int) wq->ne[1], nk = (int) wk->ne[1];
+    if (nq % 128 != 0 || nk % 128 != 0 || wv->ne[1] != nk || nq + 2 * nk > FRT_QKV_ROWS_MAX) return false;
+    const ggml_tensor * sq = frt_mm_scale_src(q.smul, q.mm), * sk = frt_mm_scale_src(k.smul, k.mm), * sv = frt_mm_scale_src(vmul, vmm);
+    if (!sq || !sk || !sv) return false;
+    // head norms: [128, h] rows, eps shared, f32 weights [128]
+    float qeps, keps;
+    memcpy(&qeps, q.norm->op_params, sizeof(float));
+    memcpy(&keps, k.norm->op_params, sizeof(float));
+    if (qeps != keps || q.norm->ne[0] != 128 || k.norm->ne[0] != 128) return false;
+    const ggml_tensor * qnw = q.nmul->src[1], * knw = k.nmul->src[1];
+    if (qnw->ne[0] != 128 || knw->ne[0] != 128 || ggml_nelements(qnw) != 128 || ggml_nelements(knw) != 128) return false;
+    if (!frt_aligned16(qnw->data) || !frt_aligned16(knw->data)) return false;
+    frt_rope_params rp = {};
+    const int32_t * pos = nullptr;
+    if (rope) {
+        frt_rope_params rk;
+        if (!frt_rope_params_of(q.rope, rp) || !frt_rope_params_of(k.rope, rk)) return false;
+        if (memcmp(&rp, &rk, sizeof(rp)) != 0 || q.rope->src[1] != k.rope->src[1]) return false;
+        if (q.rope->src[1]->type != GGML_TYPE_I32 || q.rope->src[1]->ne[0] != 1) return false;
+        pos = (const int32_t *) q.rope->src[1]->data;
+    }
+    const ggml_tensor * qfin = q.last();
+    const ggml_tensor * kfin = k.last();
+    if (qfin->type != GGML_TYPE_F32 || !ggml_is_contiguous(qfin) || qfin->ne[0] != 128 || qfin->ne[1] * 128 != nq) return false;
+    // cache writes: SET_ROWS(VIEW(head block of this token), idx) into f16 rows of nk elements
+    auto set_ok = [&](const ggml_tensor * s, const ggml_tensor * src) {
+        const ggml_tensor * v = s->src[0];
+        if (v->op != GGML_OP_VIEW || v->view_offs != 0 || v->ne[0] != nk || ggml_nrows(v) != 1) return false;
+        const ggml_tensor * vs = v->src[0];
+        if (!(vs == src || (vs->op == GGML_OP_RESHAPE && vs->src[0] == src))) return false;
+        return s->type == GGML_TYPE_F16 && s->ne[0] == nk && s->nb[0] == sizeof(half) &&
+               s->src[1]->type == GGML_TYPE_I64 && ggml_nelements(s->src[1]) == 1;
+    };
+    if (!set_ok(k_set, kfin) || !set_ok(v_set, vmul)) return false;
+    // everything inside the span except Q's final tensor and the two cache writes is internal
+    if (!frt_span_closed(cgraph, i, end, qfin, k_set)) return false;
+
+    cudaStream_t stream = ctx.stream();
+    constexpr int NW = 8;
+    const int nrows = nq + 2 * nk;
+    ggml_cuda_kernel_launch(frt_attn_qkv<NW>, ggml_cuda_kernel_launch_params((dim3) ((nrows + NW - 1) / NW), (dim3) (NW * WARP_SIZE), 0, stream),
+        (const float *) x->data, (const float *) nw->data, eps,
+        (const char *) wq->data, (const char *) wk->data, (const char *) wv->data, (size_t) wq->nb[1],
+        (const float *) sq->data, (const float *) sk->data, (const float *) sv->data,
+        g_qkv, nq, nk, 0.0f, FRT_K_EMBD);
+    const int hq = nq / 128, hk = nk / 128, nh = hq + 2 * hk;
+    constexpr int HW = 4;   // heads (warps) per CTA
+    const ggml_cuda_kernel_launch_params lp2((dim3) ((nh + HW - 1) / HW), (dim3) (HW * WARP_SIZE), 0, stream);
+    if (rope) {
+        ggml_cuda_kernel_launch(frt_attn_qkn<true>, lp2,
+            (const float *) g_qkv, (const float *) qnw->data, (const float *) knw->data, qeps,
+            (float *) qfin->data, (half *) k_set->data, (half *) v_set->data,
+            (const int64_t *) k_set->src[1]->data, (const int64_t *) v_set->src[1]->data,
+            (size_t) k_set->nb[1], (size_t) v_set->nb[1], hq, hk, pos, rp, 128);
+    } else {
+        ggml_cuda_kernel_launch(frt_attn_qkn<false>, lp2,
+            (const float *) g_qkv, (const float *) qnw->data, (const float *) knw->data, qeps,
+            (float *) qfin->data, (half *) k_set->data, (half *) v_set->data,
+            (const int64_t *) k_set->src[1]->data, (const int64_t *) v_set->src[1]->data,
+            (size_t) k_set->nb[1], (size_t) v_set->nb[1], hq, hk, (const int32_t *) nullptr, rp, 128);
+    }
+    if (frt_stats_on()) {
+        static long fires = 0;
+        if ((++fires & 0xFFF) == 1) fprintf(stderr, "frt-stats attnqkv fires=%ld span=%d rope=%d\n", fires, end - i + 1, (int) rope);
+    }
+    *skip_count = end - i + 1;
+    return true;
+}
+
+// ---- attention output projection (FRT window OPROJ) -----------------------
+// quantize(kqv_out) -> MUL_MAT(attn_output) -> MUL(scale) -> ADD(residual):
+// 3 launches -> 1, one warp per output row.
+template <int NW>
+static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_oproj(
+        const float * a, const char * w, const size_t row_stride, const float * s,
+        const float * resid, float * out, const int n_out, const float fzero) {
+    ggml_cuda_pdl_lc();
+    __shared__ block_q8_1 yq[4096 / QK8_1];
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int r = blockIdx.x * NW + warp;
+    const bool active = r < n_out;
+    frt_nvb b[4];
+    float sc = 0.0f;
+    if (active) {
+        frt_ld_row<4>(b, w + (size_t) r * row_stride, lane);
+        sc = s[0];
+    }
+    ggml_cuda_pdl_sync();
+    for (int c = warp; c < 4096 / QK8_1; c += NW) {
+        frt_q8_1_chunk(a[c * QK8_1 + lane], lane, &yq[c]);
+    }
+    __syncthreads();
+    if (!active) {
+        return;
+    }
+    const float t = frt_rowdot_k4096(b, yq, lane, fzero);
+    if (lane == 0) {
+        float result = t;
+        result *= sc;
+        result += fzero;
+        float o = result;   // k_bin_bcast add
+        o = o + resid[r];
+        out[r] = o;
+    }
+}
+
+static bool frt_oproj_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
+    static const bool on = frt_window_on("GGML_FLASHRT_NO_OPROJ");
+    if (!on || i + 2 >= cgraph->n_nodes) return false;
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT || !strstr(mm->src[0]->name, ".attn_output.weight")) return false;
+    const ggml_tensor * w = mm->src[0], * a = mm->src[1];
+    if (w->type != GGML_TYPE_NVFP4 || w->ne[0] != 4096 || !ggml_is_contiguous(w)) return false;
+    if (a->type != GGML_TYPE_F32 || a->ne[0] != 4096 || ggml_nrows(a) != 1 || !ggml_is_contiguous(a)) return false;
+    const ggml_tensor * smul = cgraph->nodes[i + 1];
+    ggml_tensor * add = cgraph->nodes[i + 2];
+    const ggml_tensor * s = frt_mm_scale_src(smul, mm);
+    if (!s || add->op != GGML_OP_ADD || add->src[0] != smul) return false;
+    const ggml_tensor * resid = add->src[1];
+    const int n_out = (int) w->ne[1];
+    if (resid->type != GGML_TYPE_F32 || !ggml_is_contiguous(resid) || resid->ne[0] != n_out || ggml_nrows(resid) != 1) return false;
+    if (add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || add->ne[0] != n_out || ggml_nrows(add) != 1) return false;
+    if (!frt_node_ok(cgraph, i, GGML_OP_MUL_MAT, 1) || !frt_node_ok(cgraph, i + 1, GGML_OP_MUL, 1) || !frt_node_ok(cgraph, i + 2, GGML_OP_ADD, 0)) return false;
+    constexpr int NW = 8;
+    ggml_cuda_kernel_launch(frt_oproj<NW>, ggml_cuda_kernel_launch_params((dim3) ((n_out + NW - 1) / NW), (dim3) (NW * WARP_SIZE), 0, ctx.stream()),
+        (const float *) a->data, (const char *) w->data, (size_t) w->nb[1], (const float *) s->data,
+        (const float *) resid->data, (float *) add->data, n_out, 0.0f);
+    *skip_count = 3;
+    return true;
+}
+
+// ---- MoE FFN span (FRT window MOEFFN) --------------------------------------
+// Replaces, for one decode token, everything after the router/top-k up to the
+// layer output: routed gate/up MUL_MAT_ID + scales + SwiGLU, the activation
+// rescale chain, routed down MUL_MAT_ID + scale, weighted expert sum, the
+// shared expert (gate, up, SwiGLU, down, scales) and both residual adds:
+// 14 stock launches -> 2.
+
+struct frt_moe_chain { float s1, b1, s2, b2, cmin, cmax, s3, b3; };
+
+// K1: one warp per GLU output; outputs [0, n_used*n_ff) routed, then n_ff_sh shared.
+template <int NW>
+static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_gu(
+        const float * act, const int32_t * ids,
+        const char * gate_w, const char * up_w, const size_t e_stride, const size_t row_stride,
+        const float * gate_sc, const float * up_sc,
+        const char * shg_w, const char * shu_w, const float * shg_sc, const float * shu_sc,
+        float * glu_out, const int n_used, const int n_ff, const int n_ff_sh, const float fzero) {
+    ggml_cuda_pdl_lc();
+    __shared__ block_q8_1 yq[FRT_K_EMBD / QK8_1];
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int o = blockIdx.x * NW + warp;
+    const int n_routed = n_used * n_ff;
+    const bool active = o < n_routed + n_ff_sh;
+    const bool routed = o < n_routed;
+    if (active && !routed) {   // shared expert rows do not depend on the router: warm L2
+        const int r = o - n_routed;
+        frt_l2_prefetch(shg_w + (size_t) r * row_stride, row_stride, lane);
+        frt_l2_prefetch(shu_w + (size_t) r * row_stride, row_stride, lane);
+    }
+    ggml_cuda_pdl_sync();
+    for (int c = warp; c < FRT_K_EMBD / QK8_1; c += NW) {
+        frt_q8_1_chunk(act[c * QK8_1 + lane], lane, &yq[c]);
+    }
+    __syncthreads();
+    if (!active) {
+        return;
+    }
+    frt_nvb bg[2], bu[2];
+    float gs, us;
+    if (routed) {
+        const int e = ids[o / n_ff];
+        const int r = o % n_ff;
+        frt_ld_row<2>(bg, gate_w + (size_t) e * e_stride + (size_t) r * row_stride, lane);
+        frt_ld_row<2>(bu, up_w   + (size_t) e * e_stride + (size_t) r * row_stride, lane);
+        gs = gate_sc[e];
+        us = up_sc[e];
+    } else {
+        const int r = o - n_routed;
+        frt_ld_row<2>(bg, shg_w + (size_t) r * row_stride, lane);
+        frt_ld_row<2>(bu, shu_w + (size_t) r * row_stride, lane);
+        gs = shg_sc[0];
+        us = shu_sc[0];
+    }
+    const float tg = frt_rowdot_k2048(bg, yq, lane, fzero);
+    const float tu = frt_rowdot_k2048(bu, yq, lane, fzero);
+    if (lane == 0) {
+        float res;
+        if (routed) {   // mmvq fused epilogue: x = up, gate = gate, SwiGLU
+            float result = tu;
+            result *= us;
+            result += fzero;
+            float gate_value = tg;
+            gate_value *= gs;
+            gate_value += fzero;
+            result *= ggml_cuda_op_silu_single(gate_value);
+            res = result;
+        } else {        // two scaled GEMVs, then the GLU kernel
+            float g = tg;
+            g *= gs;
+            g += fzero;
+            float u = tu;
+            u *= us;
+            u += fzero;
+            res = ggml_cuda_op_silu_single(g) * u;
+        }
+        glu_out[o] = res;
+    }
+}
+
+// K2: per-CTA prologue (activation rescale + q8_1 of all routed / shared GLU
+// rows into shared memory), then one warp per output row.
+template <int NW>
+static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_down(
+        const float * glu, const int32_t * ids, const float * wts,
+        const char * down_w, const size_t de_stride, const size_t drow_stride, const float * down_sc,
+        const char * shd_w, const size_t shd_row_stride, const float * shd_sc,
+        const float * resid, float * out, const frt_moe_chain ch,
+        const int n_used, const int n_ff, const int n_ff_sh, const int n_embd, const float fzero) {
+    ggml_cuda_pdl_lc();
+    __shared__ block_q8_1 yq_e[FRT_MOE_MAX_USED * 512 / QK8_1];
+    __shared__ block_q8_1 yq_s[1024 / QK8_1];
+    __shared__ float esc[FRT_MOE_MAX_USED];
+    __shared__ float sw[FRT_MOE_MAX_USED];
+    __shared__ int   sids[FRT_MOE_MAX_USED];
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int row = blockIdx.x * NW + warp;
+    const bool active = row < n_embd;
+    if (active) {   // shared-expert down row does not depend on the router: warm L2
+        frt_l2_prefetch(shd_w + (size_t) row * shd_row_stride, shd_row_stride, lane);
+    }
+    ggml_cuda_pdl_sync();
+    for (int s = warp; s < n_used; s += NW) {
+        float m = -FLT_MAX;
+        for (int j = lane; j < n_ff; j += WARP_SIZE) {
+            m = fmaxf(m, fabsf(glu[s * n_ff + j]));
+        }
+        m = warp_reduce_max(m);
+        if (lane == 0) {
+            float e = ch.s1 * m + ch.b1;
+            e = logf(e);
+            e = ch.s2 * e + ch.b2;
+            e = ceilf(e);
+            e = fminf(fmaxf(e, ch.cmin), ch.cmax);
+            e = ch.s3 * e + ch.b3;
+            e = expf(e);
+            esc[s] = e;
+            sids[s] = ids[s];
+            sw[s] = wts[s];
+        }
+    }
+    __syncthreads();
+    const int cpe = n_ff / QK8_1;
+    const int n_ce = n_used * cpe;
+    for (int c = warp; c < n_ce + n_ff_sh / QK8_1; c += NW) {
+        if (c < n_ce) {
+            const float x = glu[c * QK8_1 + lane] / esc[c / cpe];
+            frt_q8_1_chunk(x, lane, &yq_e[c]);
+        } else {
+            const int cs = c - n_ce;
+            frt_q8_1_chunk(glu[n_used * n_ff + cs * QK8_1 + lane], lane, &yq_s[cs]);
+        }
+    }
+    __syncthreads();
+    if (!active) {
+        return;
+    }
+    frt_nvb bsh, be[FRT_MOE_MAX_USED / 2];
+#pragma unroll
+    for (int p = 0; p < FRT_MOE_MAX_USED / 2; ++p) {
+        if (2 * p < n_used) {
+            const int slot = 2 * p + lane / 16;   // n_used is even (checked by the predicate)
+            be[p] = frt_ld_nvb(down_w + (size_t) sids[slot] * de_stride + (size_t) row * drow_stride,
+                               (lane % 16) / 2, frt_lane_iqs(lane));
+        }
+    }
+    bsh = frt_ld_nvb(shd_w + (size_t) row * shd_row_stride, lane / 2, frt_lane_iqs(lane));
+    const float shs = shd_sc[0];
+    float de[FRT_MOE_MAX_USED];
+#pragma unroll
+    for (int p = 0; p < FRT_MOE_MAX_USED / 2; ++p) {
+        if (2 * p < n_used) {
+            const int slot = 2 * p + lane / 16;
+            const float t = frt_rowdot_k512_pair(be[p], yq_e + slot * cpe, lane, fzero);
+            de[2 * p]     = __shfl_sync(0xffffffff, t, 0);
+            de[2 * p + 1] = __shfl_sync(0xffffffff, t, 16);
+        }
+    }
+    const float tsh = frt_rowdot_k1024(bsh, yq_s, lane, fzero);
+    if (lane == 0) {
+        float sum = 0.0f;
+        for (int s = 0; s < n_used; ++s) {
+            float r = de[s];          // mmvq epilogue: per-expert scale, zero bias
+            r *= down_sc[sids[s]];
+            r += fzero;
+            if (s == 0) {
+                sum = (r * esc[0]) * sw[0];
+            } else {
+                sum += (r * esc[s]) * sw[s];
+            }
+        }
+        float sh = tsh;
+        sh *= shs;
+        sh += fzero;
+        float result = sum;           // k_bin_bcast with two fused addends
+        result = result + sh;
+        result = result + resid[row];
+        out[row] = result;
+    }
 }
 
 static float * g_moe_glu = nullptr;   // n_used*n_ff + n_ff_sh f32, allocated eagerly
@@ -630,6 +1158,8 @@ bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     if (!frt_layer_enabled()) return false;
     static const bool cc_ok = ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL;
     if (!cc_ok) return false;
+    if (frt_attnqkv_try(ctx, cgraph, i, skip_count)) return true;
+    if (frt_oproj_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_moeffn_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_amax_try(ctx, cgraph, i, skip_count)) return true;
     return false;
@@ -641,5 +1171,6 @@ void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
     if (g_moe_glu == nullptr) {   // eager: this hook always runs before any capture begins
         ggml_cuda_set_device(ctx.device);
         CUDA_CHECK(cudaMalloc(&g_moe_glu, FRT_MOE_GLU_CAP * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_qkv, FRT_QKV_ROWS_MAX * sizeof(float)));
     }
 }
