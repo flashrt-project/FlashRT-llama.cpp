@@ -492,28 +492,27 @@ struct frt_qkn_params {
     int ncols;
 };
 
+// ATTNQKV -> ATTNDEC handoff: when the FLASH_ATTN_EXT node that follows an
+// ATTNQKV span (only views in between) is taken by ATTNDEC, the per-head
+// norm / rope / cache-write epilogue runs inside the attention kernel instead
+// of its own launch. Set by ATTNQKV, consumed by ATTNDEC on the same node.
+struct frt_fa_pending {
+    const ggml_tensor * fa = nullptr;
+    frt_qkn_params qp;
+    bool rope;
+};
+static frt_fa_pending g_fa_pend;
+static bool frt_attndec_eligible(const ggml_cgraph * cgraph, int i);
+
 // One head of the attention-front epilogue (K_qkn), one warp. Q heads [0,hq), K heads
 // [hq,hq+hk), V heads after. rope=false: stock rms_norm_f32<32,1,vec,mul>
 // (one warp per 128-wide row); rope=true: stock rms_norm_mul_rope_f32<256>
 // (8 warps, 4 of them loaded), NEOX pairs (i, i + n_dims/2), f32 out; K and V
 // rows go to the cache as f16 (set_rows).
+// Q or K head: normalized (+ roped) values out[k] for elements oix[k] of the head.
 template <bool rope>
-static __device__ __forceinline__ void frt_qkn_head(const float * qkv, const int h, const int lane, const frt_qkn_params & p) {
-    constexpr int D = 128;
-    const bool is_v = h >= p.hq + p.hk;
-    const bool is_k = !is_v && h >= p.hq;
-    const float * xc = qkv + (size_t) h * D;   // written by other CTAs of this or the previous kernel
-    if (is_v) {   // set_rows f32 -> f16 of the scaled V head
-        half * dst = (half *) ((char *) p.v_cache + (size_t) p.v_idx[0] * p.v_row_bytes) + (size_t) (h - p.hq - p.hk) * D;
-#pragma unroll
-        for (int k = 0; k < D / WARP_SIZE; ++k) {
-            dst[lane + k * WARP_SIZE] = __float2half(__ldcg(xc + lane + k * WARP_SIZE));
-        }
-        return;
-    }
-    const float * mulc = is_k ? p.kn_w : p.qn_w;
-    float out[4];
-    int   oix[4];
+static __device__ __forceinline__ void frt_qkn_vals(const float * xc, const float * mulc, const int lane,
+        const frt_qkn_params & p, float (&out)[4], int (&oix)[4]) {
     if constexpr (!rope) {
         const float4 * x4 = (const float4 *) xc;
         float4 xs[1];
@@ -582,6 +581,25 @@ static __device__ __forceinline__ void frt_qkn_head(const float * qkv, const int
             oix[2 * k + 1] = ix1;
         }
     }
+}
+
+template <bool rope>
+static __device__ __forceinline__ void frt_qkn_head(const float * qkv, const int h, const int lane, const frt_qkn_params & p) {
+    constexpr int D = 128;
+    const bool is_v = h >= p.hq + p.hk;
+    const bool is_k = !is_v && h >= p.hq;
+    const float * xc = qkv + (size_t) h * D;   // written by other CTAs of this or the previous kernel
+    if (is_v) {   // set_rows f32 -> f16 of the scaled V head
+        half * dst = (half *) ((char *) p.v_cache + (size_t) p.v_idx[0] * p.v_row_bytes) + (size_t) (h - p.hq - p.hk) * D;
+#pragma unroll
+        for (int k = 0; k < D / WARP_SIZE; ++k) {
+            dst[lane + k * WARP_SIZE] = __float2half(__ldcg(xc + lane + k * WARP_SIZE));
+        }
+        return;
+    }
+    float out[4];
+    int   oix[4];
+    frt_qkn_vals<rope>(xc, is_k ? p.kn_w : p.qn_w, lane, p, out, oix);
     if (is_k) {
         half * dst = (half *) ((char *) p.k_cache + (size_t) p.k_idx[0] * p.k_row_bytes) + (size_t) (h - p.hq) * D;
 #pragma unroll
@@ -790,9 +808,37 @@ static bool frt_attnqkv_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
             (const char *) wq->data, (const char *) wk->data, (const char *) wv->data, (size_t) wq->nb[1],
             (const float *) sq->data, (const float *) sk->data, (const float *) sv->data,
             g_qkv, nq, nk, 0.0f, FRT_K_EMBD));
-    constexpr int HW = 4;   // heads (warps) per CTA
-    const ggml_cuda_kernel_launch_params lp2((dim3) ((nh + HW - 1) / HW), (dim3) (HW * WARP_SIZE), 0, stream);
-    ggml_cuda_kernel_launch(rope ? frt_attn_qkn<true> : frt_attn_qkn<false>, lp2, (const float *) g_qkv, qp);
+    // the attention node, reached through views only: if ATTNDEC takes it, the
+    // epilogue below runs inside the attention kernel (frt_fa_pending)
+    static const bool defer_ok = !(getenv("FRT_ATTNDEC_QKN") && getenv("FRT_ATTNDEC_QKN")[0] == '0');
+    bool defer = false;
+    if (defer_ok) {
+        int j = end + 1;
+        while (j < cgraph->n_nodes && (cgraph->nodes[j]->op == GGML_OP_VIEW || cgraph->nodes[j]->op == GGML_OP_PERMUTE ||
+                                       cgraph->nodes[j]->op == GGML_OP_RESHAPE || cgraph->nodes[j]->op == GGML_OP_TRANSPOSE)) ++j;
+        if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_FLASH_ATTN_EXT) {
+            const ggml_tensor * fa = cgraph->nodes[j];
+            const ggml_tensor * fq = fa->src[0], * fk = fa->src[1], * fv = fa->src[2];
+            const ggml_tensor * kc = k_set->view_src, * vc = v_set->view_src;
+            defer = (fq == qfin || fq->view_src == qfin) && fq->data == qfin->data &&
+                    kc && vc && fk->view_src == kc && fv->view_src == vc && fk->data == kc->data && fv->data == vc->data &&
+                    k_set->data == kc->data && v_set->data == vc->data &&
+                    (size_t) fk->nb[1] == (size_t) k_set->nb[1] && (size_t) fv->nb[1] == (size_t) v_set->nb[1] &&
+                    fk->nb[2] == 128 * sizeof(half) && fv->nb[2] == 128 * sizeof(half) &&
+                    fq->nb[2] == 128 * sizeof(float) && frt_attndec_eligible(cgraph, j);
+            if (defer) {
+                GGML_ASSERT(g_fa_pend.fa == nullptr);
+                g_fa_pend.fa = fa;
+                g_fa_pend.qp = qp;
+                g_fa_pend.rope = rope;
+            }
+        }
+    }
+    if (!defer) {
+        constexpr int HW = 4;   // heads (warps) per CTA
+        const ggml_cuda_kernel_launch_params lp2((dim3) ((nh + HW - 1) / HW), (dim3) (HW * WARP_SIZE), 0, stream);
+        ggml_cuda_kernel_launch(rope ? frt_attn_qkn<true> : frt_attn_qkn<false>, lp2, (const float *) g_qkv, qp);
+    }
     if (frt_stats_on()) {
         static long fires = 0;
         if ((++fires & 0xFFF) == 1) fprintf(stderr, "frt-stats attnqkv fires=%ld span=%d rope=%d\n", fires, end - i + 1, (int) rope);
@@ -1583,17 +1629,26 @@ static constexpr int FRT_FA_PITCH = FRT_FA_D + 8;
 // partial for (query head, chunk): running max, sum and unnormalized output
 struct frt_fa_part { float m, l; };
 
-template <int R, bool PF>
+// QKN: 0 = Q from global (written by K_qkn); 1 / 2 = the per-head epilogue
+// (norm [+ rope when 2], set_rows of the new K / V row) runs here, see
+// frt_fa_pending: each CTA normalizes its 8 query heads from g_qkv, and the
+// CTA whose chunk holds the new cache cell writes that row (its KV head)
+// and patches it into its staged tile.
+template <bool PF, int QKN>
 static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode(
         const float * Q, const int64_t q_head_stride,           // f32 [D] per query head
         const char * K, const char * V, const int64_t kv_row, const int64_t kv_head,   // f16 rows
         const half * mask, const float scale, const int n_kv,
-        frt_fa_part * part_ml, float * part_o, const int n_split) {
+        frt_fa_part * part_ml, float * part_o, const int n_split,
+        const float * qkv, const frt_qkn_params qp, const int steps, const bool prestage_ok) {
     constexpr int D = FRT_FA_D;
-    constexpr int CH = FRT_FA_STEP * R;   // KV rows per CTA
+    const int CH = FRT_FA_STEP * steps;   // KV rows per CTA
+    const bool prestage = QKN != 0 && prestage_ok;
     __shared__ __align__(16) half sK[FRT_FA_STEP][FRT_FA_PITCH];
     __shared__ __align__(16) half sV[FRT_FA_STEP][FRT_FA_PITCH];
     __shared__ float sm_m[FRT_FA_NW][FRT_FA_G], sm_l[FRT_FA_NW][FRT_FA_G];
+    __shared__ float sQ[QKN ? FRT_FA_G : 1][D];
+    __shared__ __align__(16) half sNK[QKN ? D : 8], sNV[QKN ? D : 8];
     __shared__ int any_live;
     ggml_cuda_pdl_lc();
     const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
@@ -1601,15 +1656,8 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
     const int t0 = split * CH;
     const char * Kg = K + (int64_t) g * kv_head;
     const char * Vg = V + (int64_t) g * kv_head;
-    // older KV rows are already final; the newest row is written by the
-    // previous kernel, and L2 prefetches stay coherent with that write
-    for (int t = threadIdx.x; PF && t < CH && t0 + t < n_kv; t += FRT_FA_NW * WARP_SIZE) {
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(Kg + (int64_t) (t0 + t) * kv_row));
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(Kg + (int64_t) (t0 + t) * kv_row + 128));
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(Vg + (int64_t) (t0 + t) * kv_row));
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(Vg + (int64_t) (t0 + t) * kv_row + 128));
-    }
-    ggml_cuda_pdl_sync();
+    // The mask is a graph input (final before the graph starts), so the
+    // chunk's live test runs before the dependency wait.
     if (threadIdx.x == 0) {
         any_live = 0;
     }
@@ -1624,8 +1672,87 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
         }
     }
     __syncthreads();
+    const bool chunk_live = any_live != 0;
+    // Older KV rows are final before the graph starts; the only row written
+    // during this graph is the new cell. With QKN that write happens in this
+    // kernel and the staged copy of the cell is patched below, so the first
+    // step is staged before the dependency wait. Otherwise the new row comes
+    // from the previous kernel and only L2 prefetches (coherent with that
+    // write) are issued early. Masked rows are not fetched.
+    auto stage = [&](const int tb) {   // K and V rows [tb, tb + STEP): 16 B per cp.async, 16 per row
+        for (int c = threadIdx.x; c < FRT_FA_STEP * (D / 8); c += FRT_FA_NW * WARP_SIZE) {
+            const int r = c / (D / 8), cc = (c % (D / 8)) * 8;
+            const int64_t off = (int64_t) (tb + r) * kv_row + cc * (int64_t) sizeof(half);
+            frt_cp_async16(&sK[r][cc], Kg + off);
+            frt_cp_async16(&sV[r][cc], Vg + off);
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    if (chunk_live) {
+        for (int t = prestage ? FRT_FA_STEP + threadIdx.x : threadIdx.x; PF && t < CH && t0 + t < n_kv; t += FRT_FA_NW * WARP_SIZE) {
+            if (__half2float(mask[t0 + t]) == -INFINITY) {
+                continue;
+            }
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(Kg + (int64_t) (t0 + t) * kv_row));
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(Kg + (int64_t) (t0 + t) * kv_row + 128));
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(Vg + (int64_t) (t0 + t) * kv_row));
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(Vg + (int64_t) (t0 + t) * kv_row + 128));
+        }
+        if (prestage) {
+            stage(t0);
+        }
+    }
+    ggml_cuda_pdl_sync();
+    int ck = -1, cv = -1;   // new cache cells (QKN)
+    if constexpr (QKN != 0) {
+        constexpr bool rope = QKN == 2;
+        ck = (int) qp.k_idx[0];
+        cv = (int) qp.v_idx[0];
+        for (int hl = warp; hl < FRT_FA_G; hl += FRT_FA_NW) {
+            const int h = g * FRT_FA_G + hl;
+            float out[4];
+            int   oix[4];
+            frt_qkn_vals<rope>(qkv + (size_t) h * D, qp.qn_w, lane, qp, out, oix);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                sQ[hl][oix[k]] = out[k];
+            }
+            if (split == 0) {   // the Q node's own output, for completeness
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    qp.q_out[(size_t) h * D + oix[k]] = out[k];
+                }
+            }
+        }
+        // the owner of a cell is the chunk holding it (the last chunk if it lies past the view)
+        const bool own_k = (ck >= t0 && ck < t0 + CH) || (split == n_split - 1 && ck >= n_kv);
+        const bool own_v = (cv >= t0 && cv < t0 + CH) || (split == n_split - 1 && cv >= n_kv);
+        if (own_k && warp == 0) {
+            float out[4];
+            int   oix[4];
+            frt_qkn_vals<rope>(qkv + (size_t) (qp.hq + g) * D, qp.kn_w, lane, qp, out, oix);
+            half * dst = (half *) ((char *) qp.k_cache + (size_t) ck * qp.k_row_bytes) + (size_t) g * D;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const half hv = __float2half(out[k]);
+                dst[oix[k]] = hv;
+                sNK[oix[k]] = hv;
+            }
+        }
+        if (own_v && warp == 1) {
+            const float * xc = qkv + (size_t) (qp.hq + qp.hk + g) * D;
+            half * dst = (half *) ((char *) qp.v_cache + (size_t) cv * qp.v_row_bytes) + (size_t) g * D;
+#pragma unroll
+            for (int k = 0; k < D / WARP_SIZE; ++k) {
+                const half hv = __float2half(__ldcg(xc + lane + k * WARP_SIZE));
+                dst[lane + k * WARP_SIZE] = hv;
+                sNV[lane + k * WARP_SIZE] = hv;
+            }
+        }
+    }
+    __syncthreads();   // sQ / sNK / sNV
     frt_fa_part * pml = part_ml + (int64_t) (g * FRT_FA_G) * n_split + split;
-    if (!any_live) {   // fully masked chunk
+    if (!chunk_live) {   // fully masked chunk
         if (threadIdx.x < FRT_FA_G) {
             pml[(int64_t) threadIdx.x * n_split] = { -INFINITY, 0.0f };
         }
@@ -1634,7 +1761,7 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
     // Q fragments (A operand): rows 0..7 = f16 hi of query heads 0..7, rows 8..15 = f16 lo
     uint32_t qa[D / 16][4];   // {a0a1 (hi, k lo), a2a3 (lo, k lo), a4a5 (hi, k hi), a6a7 (lo, k hi)}
     {
-        const float * q = Q + (int64_t) (g * FRT_FA_G + lane / 4) * q_head_stride;
+        const float * q = QKN ? &sQ[lane / 4][0] : Q + (int64_t) (g * FRT_FA_G + lane / 4) * q_head_stride;
 #pragma unroll
         for (int kk = 0; kk < D / 16; ++kk) {
             const int c = kk * 16 + (lane % 4) * 2;
@@ -1648,21 +1775,29 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
     for (int j = 0; j < D / 8; ++j) {
         o[j][0] = o[j][1] = 0.0f;
     }
-    for (int it = 0; it < R; ++it) {
+    for (int it = 0; it < steps; ++it) {
         const int tb = t0 + it * FRT_FA_STEP;
         if (tb >= n_kv) {
             break;
         }
-        __syncthreads();   // previous step's smem reads done
-        // stage K and V rows [tb, tb + STEP): 16 B per cp.async, 16 per row
-        for (int c = threadIdx.x; c < FRT_FA_STEP * (D / 8); c += FRT_FA_NW * WARP_SIZE) {
-            const int r = c / (D / 8), cc = (c % (D / 8)) * 8;
-            const int64_t off = (int64_t) (tb + r) * kv_row + cc * (int64_t) sizeof(half);
-            frt_cp_async16(&sK[r][cc], Kg + off);
-            frt_cp_async16(&sV[r][cc], Vg + off);
+        if (!prestage || it > 0) {
+            __syncthreads();   // previous step's smem reads done
+            stage(tb);
         }
-        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory");
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
+        if constexpr (QKN != 0) {   // the new row: use this CTA's own values
+            const bool pk = ck >= tb && ck < tb + FRT_FA_STEP, pv = cv >= tb && cv < tb + FRT_FA_STEP;
+            if (pk || pv) {
+                if (pk && threadIdx.x < D / 8) {
+                    *(uint4 *) &sK[ck - tb][threadIdx.x * 8] = *(const uint4 *) &sNK[threadIdx.x * 8];
+                }
+                if (pv && threadIdx.x >= 32 && threadIdx.x < 32 + D / 8) {
+                    *(uint4 *) &sV[cv - tb][(threadIdx.x - 32) * 8] = *(const uint4 *) &sNV[(threadIdx.x - 32) * 8];
+                }
+                __syncthreads();
+            }
+        }
         // S = Q K^T for this warp's 16 rows: two n8 tiles x 8 k-steps
         const int wr = warp * 16;   // first KV row of the warp (in the step)
         float s[2][4];
@@ -1786,55 +1921,53 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
 }
 
 // one CTA per query head, one thread per dim: merge chunk partials + sink.
-// The max / denominator over the splits are reduced by the whole CTA first.
+// No block-level reduction: every thread reads the (m, l) pairs itself
+// (broadcast loads) and its own O column, CH partials per batch of
+// independent loads, merged with an online max rescale.
 static __global__ void frt_fa_combine(const frt_fa_part * part_ml, const float * part_o, const float * sinks,
         float * dst, const int64_t dst_head_stride, const int n_split) {
     ggml_cuda_pdl_lc();
     constexpr int D = FRT_FA_D;
-    __shared__ float red[D / WARP_SIZE];
-    __shared__ float sM, sL;
-    __shared__ float wsc[FRT_FA_MAX_SPLITS];
-    const int h = blockIdx.x, d = threadIdx.x, lane = d % WARP_SIZE, warp = d / WARP_SIZE;
+    constexpr int CH = 32;
+    const int h = blockIdx.x, d = threadIdx.x;
+    const float sink = sinks ? sinks[h] : -INFINITY;   // immutable
     ggml_cuda_pdl_sync();
     const frt_fa_part * pm = part_ml + (int64_t) h * n_split;
-    float m = -INFINITY;
-    for (int j = d; j < n_split; j += D) {
-        m = fmaxf(m, pm[j].m);
-    }
-    m = warp_reduce_max(m);
-    if (lane == 0) red[warp] = m;
-    __syncthreads();
-    if (d == 0) {
-        float M = sinks ? sinks[h] : -INFINITY;
-        for (int w = 0; w < D / WARP_SIZE; ++w) M = fmaxf(M, red[w]);
-        sM = M;
-    }
-    __syncthreads();
-    const float M = sM;
-    float l = 0.0f;
-    for (int j = d; j < n_split; j += D) {
-        const frt_fa_part q = pm[j];
-        const float f = q.m == -INFINITY ? 0.0f : expf(q.m - M);
-        wsc[j] = f;
-        l += q.l * f;
-    }
-    l = warp_reduce_sum(l);
-    __syncthreads();
-    if (lane == 0) red[warp] = l;
-    __syncthreads();
-    if (d == 0) {
-        float L = sinks ? expf(sinks[h] - M) : 0.0f;
-        for (int w = 0; w < D / WARP_SIZE; ++w) L += red[w];
-        sL = L;
-    }
-    __syncthreads();
     const float * po = part_o + (int64_t) h * n_split * D + d;
-    float acc = 0.0f;
-#pragma unroll 4
-    for (int j = 0; j < n_split; ++j) {
-        acc += po[(int64_t) j * D] * wsc[j];
+    float M = sink, L = sinks ? 1.0f : 0.0f, acc = 0.0f;   // the sink adds exp(sink - M) to the denominator only
+    for (int j0 = 0; j0 < n_split; j0 += CH) {
+        frt_fa_part q[CH];
+        float o[CH];
+#pragma unroll
+        for (int k = 0; k < CH; ++k) {
+            if (j0 + k < n_split) {
+                q[k] = pm[j0 + k];
+                o[k] = po[(int64_t) (j0 + k) * D];
+            } else {
+                q[k] = { -INFINITY, 0.0f };
+                o[k] = 0.0f;
+            }
+        }
+        float mc = M;
+#pragma unroll
+        for (int k = 0; k < CH; ++k) {
+            mc = fmaxf(mc, q[k].m);
+        }
+        if (mc == -INFINITY) {
+            continue;   // nothing live yet
+        }
+        const float f = expf(M - mc);   // M == -inf -> 0 (L and acc are 0 then)
+        L *= f;
+        acc *= f;
+#pragma unroll
+        for (int k = 0; k < CH; ++k) {
+            const float w = expf(q[k].m - mc);   // masked chunk: m = -inf -> 0
+            L   += q[k].l * w;
+            acc += o[k] * w;
+        }
+        M = mc;
     }
-    dst[(int64_t) h * dst_head_stride + d] = acc / sL;
+    dst[(int64_t) h * dst_head_stride + d] = acc / L;
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
@@ -1843,10 +1976,19 @@ static frt_fa_part * g_fa_ml = nullptr;
 static float * g_fa_o = nullptr;
 static constexpr int FRT_FA_HEADS_MAX = 64;
 
-static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
+static bool frt_attndec_on() {
     static const bool on = frt_layer_enabled() && getenv("FRT_ATTNDEC") && getenv("FRT_ATTNDEC")[0] == '1';
-    if (!on || g_fa_ml == nullptr) return false;
-    ggml_tensor * fa = cgraph->nodes[i];
+    return on && g_fa_ml != nullptr;
+}
+
+struct frt_fa_plan {
+    const ggml_tensor * Q, * K, * V, * mask, * sinks;
+    float scale;
+    int n_kv, steps, n_split;
+};
+
+static bool frt_attndec_plan(const ggml_cgraph * cgraph, const int i, frt_fa_plan & pl) {
+    const ggml_tensor * fa = cgraph->nodes[i];
     if (fa->op != GGML_OP_FLASH_ATTN_EXT) return false;
     // the fuse hook treats a 1-node window as "not fused" and would run the
     // stock kernel over our output: consume the pure-view reshape that follows
@@ -1871,28 +2013,55 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     const int n_kv = (int) K->ne[1];
     if (n_kv % FRT_FA_STEP != 0) return false;   // the cache view is padded to 256 rows
     if (((uintptr_t) K->data | (uintptr_t) V->data | (size_t) K->nb[1] | (size_t) K->nb[2]) & 15) return false;
-    // tokens per CTA: aim for ~2 CTAs per SM over the KV heads, at most MAX_SPLITS chunks
-    static const int target_splits = getenv("FRT_ATTNDEC_SPLITS") ? atoi(getenv("FRT_ATTNDEC_SPLITS")) : 96;
-    int R = 1;
-    while (R < 16 && ((n_kv + FRT_FA_STEP * R - 1) / (FRT_FA_STEP * R) > target_splits ||
-                      (n_kv + FRT_FA_STEP * R - 1) / (FRT_FA_STEP * R) > FRT_FA_MAX_SPLITS)) R *= 2;
-    if ((n_kv + FRT_FA_STEP * R - 1) / (FRT_FA_STEP * R) > FRT_FA_MAX_SPLITS) return false;
-    const int n_split = (n_kv + FRT_FA_STEP * R - 1) / (FRT_FA_STEP * R);
+    // chunking: up to two CTAs per SM over (chunk, KV head); each CTA walks
+    // its chunk 64 rows at a time, so a second resident CTA hides the
+    // stage -> compute latency (measured: 1x SM count is 4% slower at 16k
+    // context, equal below 4k)
+    static const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    static const int target_ctas = getenv("FRT_ATTNDEC_CTAS") ? atoi(getenv("FRT_ATTNDEC_CTAS")) : 2 * nsm;
+    const int tiles = n_kv / FRT_FA_STEP;
+    const int max_split = std::max(1, std::min(FRT_FA_MAX_SPLITS, target_ctas / (int) K->ne[2]));
+    const int steps = (tiles + max_split - 1) / max_split;
+    const int n_split = (tiles + steps - 1) / steps;
+    pl = { Q, K, V, mask, sinks, scale, n_kv, steps, n_split };
+    return true;
+}
+
+static bool frt_attndec_eligible(const ggml_cgraph * cgraph, int i) {
+    frt_fa_plan pl;
+    return frt_attndec_on() && frt_attndec_plan(cgraph, i, pl);
+}
+
+static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
+    ggml_tensor * fa = cgraph->nodes[i];
+    const bool fused = g_fa_pend.fa != nullptr && g_fa_pend.fa == fa;
+    frt_fa_plan pl;
+    if (!frt_attndec_on() || !frt_attndec_plan(cgraph, i, pl)) {
+        GGML_ASSERT(!fused && "ATTNQKV deferred its epilogue to an attention node ATTNDEC cannot take");
+        return false;
+    }
+    const frt_qkn_params qp = fused ? g_fa_pend.qp : frt_qkn_params{};
+    const int qkn = fused ? (g_fa_pend.rope ? 2 : 1) : 0;
+    g_fa_pend.fa = nullptr;
+    const ggml_tensor * Q = pl.Q, * K = pl.K, * V = pl.V;
+    const int n_kv = pl.n_kv, steps = pl.steps, n_split = pl.n_split;
     cudaStream_t stream = ctx.stream();
     const dim3 grid((unsigned) n_split, (unsigned) K->ne[2]);
     const ggml_cuda_kernel_launch_params lp(grid, (dim3) (FRT_FA_NW * WARP_SIZE), 0, stream);
+    // first-step staging before the dependency wait pays off while the grid
+    // fits one CTA per SM (measured: slower beyond that)
+    static const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    const bool prestage = n_split * (int) K->ne[2] <= nsm;
     auto launch = [&](auto kernel) {
         ggml_cuda_kernel_launch(kernel, lp, (const float *) Q->data, (int64_t) (Q->nb[2] / sizeof(float)),
             (const char *) K->data, (const char *) V->data, (int64_t) K->nb[1], (int64_t) K->nb[2],
-            (const half *) mask->data, scale, n_kv, g_fa_ml, g_fa_o, n_split);
+            (const half *) pl.mask->data, pl.scale, n_kv, g_fa_ml, g_fa_o, n_split, (const float *) g_qkv, qp, steps, prestage);
     };
     static const bool pf = !(getenv("FRT_ATTNDEC_PF") && getenv("FRT_ATTNDEC_PF")[0] == '0');   // measured: prefetch on is faster
-    switch (R) {
-        case 1:  pf ? launch(frt_fa_decode<1, true>)  : launch(frt_fa_decode<1, false>);  break;
-        case 2:  pf ? launch(frt_fa_decode<2, true>)  : launch(frt_fa_decode<2, false>);  break;
-        case 4:  pf ? launch(frt_fa_decode<4, true>)  : launch(frt_fa_decode<4, false>);  break;
-        case 8:  pf ? launch(frt_fa_decode<8, true>)  : launch(frt_fa_decode<8, false>);  break;
-        default: pf ? launch(frt_fa_decode<16, true>) : launch(frt_fa_decode<16, false>); break;
+    switch (qkn) {
+        case 0:  pf ? launch(frt_fa_decode<true, 0>) : launch(frt_fa_decode<false, 0>); break;
+        case 1:  pf ? launch(frt_fa_decode<true, 1>) : launch(frt_fa_decode<false, 1>); break;
+        default: pf ? launch(frt_fa_decode<true, 2>) : launch(frt_fa_decode<false, 2>); break;
     }
     // FRT_ATTNDEC_CHECK=k (test aid, eager mode only): every k-th call also runs
     // ggml's kernel on the same inputs and prints the max abs / rel difference
@@ -1905,7 +2074,7 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
         CUDA_CHECK(cudaMalloc(&chk, ggml_nbytes(fa)));
     }
     ggml_cuda_kernel_launch(frt_fa_combine, ggml_cuda_kernel_launch_params((dim3) (unsigned) Q->ne[2], (dim3) FRT_FA_D, 0, stream),
-        (const frt_fa_part *) g_fa_ml, (const float *) g_fa_o, sinks ? (const float *) sinks->data : (const float *) nullptr,
+        (const frt_fa_part *) g_fa_ml, (const float *) g_fa_o, pl.sinks ? (const float *) pl.sinks->data : (const float *) nullptr,
         chk ? chk : (float *) fa->data, (int64_t) (fa->nb[1] / sizeof(float)), n_split);
     if (chk) {
         ggml_cuda_flash_attn_ext(ctx, fa);
@@ -1916,7 +2085,7 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
         double md = 0, mr = 0, nb = 0;
         for (size_t k = 0; k < a.size(); ++k) { md = std::max(md, (double) fabsf(a[k] - b[k])); nb = std::max(nb, (double) fabsf(b[k])); }
         mr = md / std::max(nb, 1e-20);
-        fprintf(stderr, "frt-attndec-check %s n_kv=%d splits=%d R=%d max|d|=%.3g max|ref|=%.3g rel=%.3g\n", fa->name, n_kv, n_split, R, md, nb, mr);
+        fprintf(stderr, "frt-attndec-check %s n_kv=%d splits=%d steps=%d qkn=%d max|d|=%.3g max|ref|=%.3g rel=%.3g\n", fa->name, n_kv, n_split, steps, qkn, md, nb, mr);
         CUDA_CHECK(cudaFree(chk));
     }
     *skip_count = 2;
