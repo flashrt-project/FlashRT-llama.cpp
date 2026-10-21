@@ -67,6 +67,24 @@ static void frt_dump_graph(const ggml_cgraph * cgraph) {
     fprintf(stderr, "frt: graph dumped (%d nodes)\n", cgraph->n_nodes);
 }
 
+// warps per CTA of a GEMV window (tile search: FRT_NW_<KERNEL>=4|8|16)
+static int frt_cfg_nw(const char * env, const int def) {
+    const char * e = getenv(env);
+    const int v = e ? atoi(e) : def;
+    return (v == 4 || v == 8 || v == 16 || v == 32) ? v : def;
+}
+
+#define FRT_NW_DISPATCH(nw, ...) do { switch (nw) { \
+    case 4:  { constexpr int NWT = 4;  __VA_ARGS__; } break; \
+    case 16: { constexpr int NWT = 16; __VA_ARGS__; } break; \
+    default: { constexpr int NWT = 8;  __VA_ARGS__; } break; } } while (0)
+
+#define FRT_NW_DISPATCH32(nw, ...) do { switch (nw) { \
+    case 4:  { constexpr int NWT = 4;  __VA_ARGS__; } break; \
+    case 8:  { constexpr int NWT = 8;  __VA_ARGS__; } break; \
+    case 32: { constexpr int NWT = 32; __VA_ARGS__; } break; \
+    default: { constexpr int NWT = 16; __VA_ARGS__; } break; } } while (0)
+
 static bool frt_stats_on(void) {
     static int on = -1;
     if (on < 0) { const char * s = getenv("FRT_STATS"); on = (s && s[0] == '1') ? 1 : 0; }
@@ -412,13 +430,15 @@ static __device__ __forceinline__ void frt_ld_row(frt_nvb (&b)[NB], const char *
 template <int NW>
 static __device__ __forceinline__ void frt_rms_norm_2048(const float * x, const float * w, const float eps,
         float * out, float * red, const int ncols) {
-    static_assert(512 % (NW * WARP_SIZE) == 0, "virtual block of 512 threads");
-    constexpr int VPT = 512 / (NW * WARP_SIZE);   // virtual threads per real thread
+    constexpr int NT = NW * WARP_SIZE;
+    static_assert(NT >= 512 ? NT % 512 == 0 : 512 % NT == 0, "virtual block of 512 threads");
+    constexpr int VPT = NT >= 512 ? 1 : 512 / NT;   // virtual threads per real thread
+    const bool part = NT <= 512 || threadIdx.x < 512;
     const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
     const float4 * x4 = (const float4 *) x;
     float4 xs[VPT];
 #pragma unroll
-    for (int k = 0; k < VPT; ++k) {
+    for (int k = 0; k < VPT && part; ++k) {
         const int v = threadIdx.x + k * NW * WARP_SIZE;   // virtual thread id
         float4 xv[1];
         float tmp = 0.0f;
@@ -435,7 +455,7 @@ static __device__ __forceinline__ void frt_rms_norm_2048(const float * x, const 
     const float4 * w4 = (const float4 *) w;
     float4 * o4 = (float4 *) out;
 #pragma unroll
-    for (int k = 0; k < VPT; ++k) {
+    for (int k = 0; k < VPT && part; ++k) {
         const int v = threadIdx.x + k * NW * WARP_SIZE;
         float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
         const float4 m = w4[v];
@@ -756,19 +776,19 @@ static bool frt_attnqkv_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     if (!frt_span_closed(cgraph, i, end, { qfin, k_set })) return false;
 
     cudaStream_t stream = ctx.stream();
-    constexpr int NW = 8;
+    static const int nw_qkv = frt_cfg_nw("FRT_NW_QKV", 16);   // tile search: 16 > 8 > 4
     const int nrows = nq + 2 * nk;
     const int hq = nq / 128, hk = nk / 128, nh = hq + 2 * hk;
     const frt_qkn_params qp = { (const float *) qnw->data, (const float *) knw->data, qeps,
         (float *) qfin->data, (half *) k_set->data, (half *) v_set->data,
         (const int64_t *) k_set->src[1]->data, (const int64_t *) v_set->src[1]->data,
         (size_t) k_set->nb[1], (size_t) v_set->nb[1], hq, hk, pos, rp, 128 };
-    const ggml_cuda_kernel_launch_params lp1((dim3) ((nrows + NW - 1) / NW), (dim3) (NW * WARP_SIZE), 0, stream);
-    ggml_cuda_kernel_launch(frt_attn_qkv<NW>, lp1,
-        (const float *) x->data, (const float *) nw->data, eps,
-        (const char *) wq->data, (const char *) wk->data, (const char *) wv->data, (size_t) wq->nb[1],
-        (const float *) sq->data, (const float *) sk->data, (const float *) sv->data,
-        g_qkv, nq, nk, 0.0f, FRT_K_EMBD);
+    FRT_NW_DISPATCH32(nw_qkv,
+        ggml_cuda_kernel_launch(frt_attn_qkv<NWT>, ggml_cuda_kernel_launch_params((dim3) ((nrows + NWT - 1) / NWT), (dim3) (NWT * WARP_SIZE), 0, stream),
+            (const float *) x->data, (const float *) nw->data, eps,
+            (const char *) wq->data, (const char *) wk->data, (const char *) wv->data, (size_t) wq->nb[1],
+            (const float *) sq->data, (const float *) sk->data, (const float *) sv->data,
+            g_qkv, nq, nk, 0.0f, FRT_K_EMBD));
     constexpr int HW = 4;   // heads (warps) per CTA
     const ggml_cuda_kernel_launch_params lp2((dim3) ((nh + HW - 1) / HW), (dim3) (HW * WARP_SIZE), 0, stream);
     ggml_cuda_kernel_launch(rope ? frt_attn_qkn<true> : frt_attn_qkn<false>, lp2, (const float *) g_qkv, qp);
@@ -835,10 +855,11 @@ static bool frt_oproj_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
     if (!frt_node_ok(cgraph, i, GGML_OP_MUL_MAT, 1) || !frt_node_ok(cgraph, i + 1, GGML_OP_MUL, 1) || !frt_node_ok(cgraph, i + 2, GGML_OP_ADD, 0)) return false;
     // every CTA reads all of `a`; thread r reads resid[r] before writing out[r]
     if (frt_overlap(add, a) || (add->data != resid->data && frt_overlap(add, resid))) return false;
-    constexpr int NW = 8;
-    ggml_cuda_kernel_launch(frt_oproj<NW>, ggml_cuda_kernel_launch_params((dim3) ((n_out + NW - 1) / NW), (dim3) (NW * WARP_SIZE), 0, ctx.stream()),
-        (const float *) a->data, (const char *) w->data, (size_t) w->nb[1], (const float *) s->data,
-        (const float *) resid->data, (float *) add->data, n_out, 0.0f);
+    static const int nw_op = frt_cfg_nw("FRT_NW_OPROJ", 16);   // tile search: 16 > 8 > 4
+    FRT_NW_DISPATCH(nw_op,
+        ggml_cuda_kernel_launch(frt_oproj<NWT>, ggml_cuda_kernel_launch_params((dim3) ((n_out + NWT - 1) / NWT), (dim3) (NWT * WARP_SIZE), 0, ctx.stream()),
+            (const float *) a->data, (const char *) w->data, (size_t) w->nb[1], (const float *) s->data,
+            (const float *) resid->data, (float *) add->data, n_out, 0.0f));
     *skip_count = 3;
     return true;
 }
@@ -863,72 +884,14 @@ static unsigned int * g_route_count = nullptr;
 static block_q8_1 * g_act_q8 = nullptr;          // q8_1 of the ffn-normed activation (64 blocks)
 static const void * g_act_q8_src = nullptr;      // tensor data the last matched ROUTE published for
 
-template <int NW>
-static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_route(
-        const float * x, const float * norm_w, const float eps, const int ncols, float * xn_out,
-        const nv_bfloat16 * wr, const int64_t wr_stride, float * logits, unsigned int * count,
-        int32_t * ids_out, float * w_out, const int n_expert_used, const float clamp_val, const float scale_val,
-        block_q8_1 * xq_out, int32_t * ids_snap, float * w_snap) {
-    static_assert(NW * WARP_SIZE == 256, "mul_mat_vec_f block size");
+// topk_moe_cuda<256, false> for one row, one warp: sigmoid, iterative top-k
+// (lower index wins ties), clamped-sum weight normalization. Outputs go to
+// two destinations (graph tensor and private snapshot); logits are read
+// through L2 (written by other CTAs).
+static __device__ __forceinline__ void frt_topk256_warp(const float * logits, const int n_expert_used,
+        const float clamp_val, const float scale_val, const int lane,
+        int32_t * ids_out, float * w_out, int32_t * ids_snap, float * w_snap) {
     constexpr int n_experts = 256;
-    ggml_cuda_pdl_lc();
-    __shared__ float xn[FRT_K_EMBD];
-    __shared__ float red[32];
-    __shared__ float buf_iw[WARP_SIZE];
-    __shared__ bool last;
-    const int tid = threadIdx.x, warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
-    const int row = blockIdx.x;
-    // router row (immutable): fetch before the dependency wait
-    const nv_bfloat162 * x2 = (const nv_bfloat162 *) (wr + (int64_t) row * wr_stride);
-    nv_bfloat162 wv[FRT_K_EMBD / 2 / 256];
-#pragma unroll
-    for (int k = 0; k < FRT_K_EMBD / 2 / 256; ++k) {
-        wv[k] = x2[tid + 256 * k];
-    }
-    if (tid < WARP_SIZE) {
-        buf_iw[tid] = 0.0f;
-    }
-    ggml_cuda_pdl_sync();
-    frt_rms_norm_2048<NW>(x, norm_w, eps, xn, red, ncols);
-    __syncthreads();
-    if (row == 0) {
-        for (int c = tid; c < FRT_K_EMBD / 4; c += 256) {
-            ((float4 *) xn_out)[c] = ((const float4 *) xn)[c];
-        }
-    }
-    if (row < FRT_K_EMBD / QK8_1 / NW) {   // q8_1 of the activation for the expert GEMVs, one chunk per warp
-        const int c = row * NW + warp;
-        frt_q8_1_chunk(xn[c * QK8_1 + lane], lane, &xq_out[c]);
-    }
-    // mul_mat_vec_f<nv_bfloat16, float, 1, 256>
-    const float2 * y2 = (const float2 *) xn;
-    float sumf = 0.0f;
-#pragma unroll
-    for (int k = 0; k < FRT_K_EMBD / 2 / 256; ++k) {
-        const int col2 = tid + 256 * k;
-        const nv_bfloat162 tmpx = wv[k];
-        const float2 tmpy = y2[col2];
-        ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
-        ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
-    }
-    sumf = warp_reduce_sum<WARP_SIZE>(sumf);
-    buf_iw[tid / WARP_SIZE] = sumf;
-    __syncthreads();
-    if (tid < WARP_SIZE) {
-        sumf = buf_iw[tid];
-        sumf = warp_reduce_sum<WARP_SIZE>(sumf);
-    }
-    if (tid == 0) {
-        logits[row] = sumf;
-        __threadfence();
-        last = atomicAdd(count, 1u) == gridDim.x - 1;
-    }
-    __syncthreads();
-    if (!last || warp != 0) {
-        return;
-    }
-    __threadfence();
-    // topk_moe_cuda<256, false>: sigmoid, top-k, normalized weights
     constexpr int experts_per_thread = n_experts / WARP_SIZE;
     float wt[experts_per_thread];
 #pragma unroll
@@ -997,6 +960,79 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_route(
             w_snap[idx] = output_weights[i] * scale_val;
         }
     }
+}
+
+template <int NW>   // NW * 32 = 256 x (router rows per CTA)
+static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_route(
+        const float * x, const float * norm_w, const float eps, const int ncols, float * xn_out,
+        const nv_bfloat16 * wr, const int64_t wr_stride, float * logits, unsigned int * count,
+        int32_t * ids_out, float * w_out, const int n_expert_used, const float clamp_val, const float scale_val,
+        block_q8_1 * xq_out, int32_t * ids_snap, float * w_snap) {
+    constexpr int RPC = NW * WARP_SIZE / 256;   // router rows per CTA, one 256-thread group each
+    static_assert(RPC * 256 == NW * WARP_SIZE, "mul_mat_vec_f block size");
+    constexpr int n_experts = 256;
+    ggml_cuda_pdl_lc();
+    __shared__ float xn[FRT_K_EMBD];
+    __shared__ float red[32];
+    __shared__ float buf_iw[RPC][WARP_SIZE];
+    __shared__ bool last;
+    const int tid = threadIdx.x, warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
+    const int grp = tid / 256, t256 = tid % 256;
+    const int row = blockIdx.x * RPC + grp;
+    // router row (immutable): fetch before the dependency wait
+    const nv_bfloat162 * x2 = (const nv_bfloat162 *) (wr + (int64_t) row * wr_stride);
+    nv_bfloat162 wv[FRT_K_EMBD / 2 / 256];
+#pragma unroll
+    for (int k = 0; k < FRT_K_EMBD / 2 / 256; ++k) {
+        wv[k] = x2[t256 + 256 * k];
+    }
+    if (t256 < WARP_SIZE) {
+        buf_iw[grp][t256] = 0.0f;
+    }
+    ggml_cuda_pdl_sync();
+    frt_rms_norm_2048<NW>(x, norm_w, eps, xn, red, ncols);
+    __syncthreads();
+    if (blockIdx.x == 0) {
+        for (int c = tid; c < FRT_K_EMBD / 4; c += NW * WARP_SIZE) {
+            ((float4 *) xn_out)[c] = ((const float4 *) xn)[c];
+        }
+    }
+    if (blockIdx.x < FRT_K_EMBD / QK8_1 / NW) {   // q8_1 of the activation for the expert GEMVs, one chunk per warp
+        const int c = blockIdx.x * NW + warp;
+        frt_q8_1_chunk(xn[c * QK8_1 + lane], lane, &xq_out[c]);
+    }
+    // mul_mat_vec_f<nv_bfloat16, float, 1, 256>, one group per row
+    const float2 * y2 = (const float2 *) xn;
+    float sumf = 0.0f;
+#pragma unroll
+    for (int k = 0; k < FRT_K_EMBD / 2 / 256; ++k) {
+        const int col2 = t256 + 256 * k;
+        const nv_bfloat162 tmpx = wv[k];
+        const float2 tmpy = y2[col2];
+        ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+        ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+    }
+    sumf = warp_reduce_sum<WARP_SIZE>(sumf);
+    buf_iw[grp][t256 / WARP_SIZE] = sumf;
+    __syncthreads();
+    if (t256 < WARP_SIZE) {
+        sumf = buf_iw[grp][t256];
+        sumf = warp_reduce_sum<WARP_SIZE>(sumf);
+        if (t256 == 0) {
+            logits[row] = sumf;
+            __threadfence();
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        last = atomicAdd(count, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last || warp != 0) {
+        return;
+    }
+    __threadfence();
+    frt_topk256_warp(logits, n_expert_used, clamp_val, scale_val, lane, ids_out, w_out, ids_snap, w_snap);
     if (lane == 0) {
         *count = 0;   // ready for the next layer
     }
@@ -1046,12 +1082,19 @@ static bool frt_route_match(ggml_cgraph * cgraph, int i, frt_route_m & m) {
 }
 
 static void frt_route_launch(ggml_backend_cuda_context & ctx, const frt_route_m & m) {
-    constexpr int NW = 8;
-    const ggml_cuda_kernel_launch_params lp((dim3) 256, (dim3) (NW * WARP_SIZE), 0, ctx.stream());
-    ggml_cuda_kernel_launch(frt_route<NW>, lp,
-        (const float *) m.x->data, (const float *) m.nw->data, m.eps, FRT_K_EMBD, (float *) m.fn->data,
-        (const nv_bfloat16 *) m.wr->data, (int64_t) (m.wr->nb[1] / sizeof(nv_bfloat16)), g_route_logits, g_route_count,
-        (int32_t *) m.as->data, (float *) m.dv->data, m.n_used, m.clamp_val, 1.0f, g_act_q8, g_moe_tail.ids, g_moe_tail.wts);
+    static const int nw = frt_cfg_nw("FRT_NW_ROUTE", 16) == 8 ? 8 : 16;   // 512 (2 rows / CTA) >= 256 threads
+    auto launch = [&](auto kernel, const int nwt) {
+        const ggml_cuda_kernel_launch_params lp((dim3) (256 / (nwt / 8)), (dim3) (nwt * WARP_SIZE), 0, ctx.stream());
+        ggml_cuda_kernel_launch(kernel, lp,
+            (const float *) m.x->data, (const float *) m.nw->data, m.eps, FRT_K_EMBD, (float *) m.fn->data,
+            (const nv_bfloat16 *) m.wr->data, (int64_t) (m.wr->nb[1] / sizeof(nv_bfloat16)), g_route_logits, g_route_count,
+            (int32_t *) m.as->data, (float *) m.dv->data, m.n_used, m.clamp_val, 1.0f, g_act_q8, g_moe_tail.ids, g_moe_tail.wts);
+    };
+    if (nw == 16) {
+        launch(frt_route<16>, 16);
+    } else {
+        launch(frt_route<8>, 8);
+    }
 }
 
 static bool frt_route_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
@@ -1422,26 +1465,27 @@ static bool frt_moeffn_match(ggml_cgraph * cgraph, int i, frt_moeffn_m & m) {
 
 static void frt_moeffn_launch(ggml_backend_cuda_context & ctx, const frt_moeffn_m & m, const bool act_q8) {
     cudaStream_t stream = ctx.stream();
-    constexpr int NW1 = 8;
+    static const int nw_gu = frt_cfg_nw("FRT_NW_GU", 4);      // tile search: 4 >= 8 > 16
     const int n_out1 = m.n_used * m.n_ff + m.n_ff_sh;
-    const ggml_cuda_kernel_launch_params lp1((dim3) ((n_out1 + NW1 - 1) / NW1), (dim3) (NW1 * WARP_SIZE), 0, stream);
-    auto gu = act_q8 ? frt_moe_gu<NW1, true> : frt_moe_gu<NW1, false>;
-    ggml_cuda_kernel_launch(gu, lp1,
-        (const float *) m.act->data, (const block_q8_1 *) g_act_q8, (const int32_t *) m.ids->data, (const float *) m.wts->data,
-        (const char *) m.gw->data, (const char *) m.uw->data, (size_t) m.gw->nb[2], (size_t) m.gw->nb[1],
-        (const float *) m.gsc->data, (const float *) m.usc->data,
-        (const char *) m.shgw->data, (const char *) m.shuw->data, (const float *) m.shgs->data, (const float *) m.shus->data,
-        g_moe_glu, g_moe_tail, m.n_used, m.n_ff, m.n_ff_sh, 0.0f);
+    FRT_NW_DISPATCH(nw_gu,
+        const ggml_cuda_kernel_launch_params lp1((dim3) ((n_out1 + NWT - 1) / NWT), (dim3) (NWT * WARP_SIZE), 0, stream);
+        ggml_cuda_kernel_launch(act_q8 ? frt_moe_gu<NWT, true> : frt_moe_gu<NWT, false>, lp1,
+            (const float *) m.act->data, (const block_q8_1 *) g_act_q8, (const int32_t *) m.ids->data, (const float *) m.wts->data,
+            (const char *) m.gw->data, (const char *) m.uw->data, (size_t) m.gw->nb[2], (size_t) m.gw->nb[1],
+            (const float *) m.gsc->data, (const float *) m.usc->data,
+            (const char *) m.shgw->data, (const char *) m.shuw->data, (const float *) m.shgs->data, (const float *) m.shus->data,
+            g_moe_glu, g_moe_tail, m.n_used, m.n_ff, m.n_ff_sh, 0.0f));
     constexpr int NWQ = 16;   // n_ff = 512 = NWQ * 32 (pinned by the predicate)
     ggml_cuda_kernel_launch(frt_moe_glu_q8<NWQ>, ggml_cuda_kernel_launch_params((dim3) (m.n_used + 1), (dim3) (NWQ * WARP_SIZE), 0, stream),
         (const float *) g_moe_glu, g_moe_tail, m.ch, m.n_used, m.n_ff, m.n_ff_sh);
-    constexpr int NW2 = 8;
-    ggml_cuda_kernel_launch(frt_moe_down<NW2>, ggml_cuda_kernel_launch_params((dim3) ((m.K + NW2 - 1) / NW2), (dim3) (NW2 * WARP_SIZE), 0, stream),
-        (const block_q8_1 *) g_moe_tail.glu_q8, (const float *) g_moe_tail.esc, (const int32_t *) g_moe_tail.ids, (const float *) g_moe_tail.wts,
-        (const char *) m.dw->data, (size_t) m.dw->nb[2], (size_t) m.dw->nb[1], (const float *) m.dsc->data,
-        (const char *) m.shdw->data, (size_t) m.shdw->nb[1], (const float *) m.shds->data,
-        (const float *) m.resid->data, (float *) m.l_out->data,
-        m.n_used, m.n_ff, m.K, 0.0f);
+    static const int nw_dn = frt_cfg_nw("FRT_NW_DOWN", 8);
+    FRT_NW_DISPATCH(nw_dn,
+        ggml_cuda_kernel_launch(frt_moe_down<NWT>, ggml_cuda_kernel_launch_params((dim3) ((m.K + NWT - 1) / NWT), (dim3) (NWT * WARP_SIZE), 0, stream),
+            (const block_q8_1 *) g_moe_tail.glu_q8, (const float *) g_moe_tail.esc, (const int32_t *) g_moe_tail.ids, (const float *) g_moe_tail.wts,
+            (const char *) m.dw->data, (size_t) m.dw->nb[2], (size_t) m.dw->nb[1], (const float *) m.dsc->data,
+            (const char *) m.shdw->data, (size_t) m.shdw->nb[1], (const float *) m.shds->data,
+            (const float *) m.resid->data, (float *) m.l_out->data,
+            m.n_used, m.n_ff, m.K, 0.0f));
     if (frt_stats_on()) {
         static long fires = 0;
         if ((++fires & 0xFFF) == 1) fprintf(stderr, "frt-stats moeffn fires=%ld act_q8=%d\n", fires, (int) act_q8);
