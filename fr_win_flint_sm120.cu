@@ -1259,19 +1259,36 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_down(
     }
     // shared-expert down row does not depend on the router: warm L2
     frt_l2_prefetch(shd_w + (size_t) row * shd_row_stride, shd_row_stride, lane);
+    const float shs = shd_sc[0];
     ggml_cuda_pdl_sync();
     const int cpe = n_ff / QK8_1;
+    // per-slot scalars, lane s holds slot s: loaded in parallel instead of a serial chain in the epilogue
+    int sid = 0;
+    float sw = 0.0f, se = 0.0f, sds = 0.0f;
+    if (lane < n_used) {
+        sid = ids[lane];
+        sw  = wts[lane];
+        se  = esc[lane];
+        sds = down_sc[sid];
+    }
     frt_nvb be[FRT_MOE_MAX_USED / 2];
 #pragma unroll
     for (int p = 0; p < FRT_MOE_MAX_USED / 2; ++p) {
+        const int slot = 2 * p + lane / 16;   // n_used is even (checked by the predicate)
+        const int id = __shfl_sync(0xffffffff, sid, slot);
         if (2 * p < n_used) {
-            const int slot = 2 * p + lane / 16;   // n_used is even (checked by the predicate)
-            be[p] = frt_ld_nvb(down_w + (size_t) ids[slot] * de_stride + (size_t) row * drow_stride,
+            be[p] = frt_ld_nvb(down_w + (size_t) id * de_stride + (size_t) row * drow_stride,
                                (lane % 16) / 2, frt_lane_iqs(lane));
         }
     }
     const frt_nvb bsh = frt_ld_nvb(shd_w + (size_t) row * shd_row_stride, lane / 2, frt_lane_iqs(lane));
-    const float shs = shd_sc[0];
+    float ds[FRT_MOE_MAX_USED], ws[FRT_MOE_MAX_USED], es[FRT_MOE_MAX_USED];
+#pragma unroll
+    for (int k = 0; k < FRT_MOE_MAX_USED; ++k) {
+        ds[k] = __shfl_sync(0xffffffff, sds, k);
+        ws[k] = __shfl_sync(0xffffffff, sw, k);
+        es[k] = __shfl_sync(0xffffffff, se, k);
+    }
     float de[FRT_MOE_MAX_USED];
 #pragma unroll
     for (int p = 0; p < FRT_MOE_MAX_USED / 2; ++p) {
@@ -1285,14 +1302,17 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_down(
     const float tsh = frt_rowdot_k1024(bsh, glu_q8 + n_used * cpe, lane, fzero);
     if (lane == 0) {
         float sum = 0.0f;
-        for (int s = 0; s < n_used; ++s) {
-            float r = de[s];          // mmvq epilogue: per-expert scale, zero bias
-            r *= down_sc[ids[s]];
-            r += fzero;
-            if (s == 0) {
-                sum = (r * esc[0]) * wts[0];
-            } else {
-                sum += (r * esc[s]) * wts[s];
+#pragma unroll
+        for (int s = 0; s < FRT_MOE_MAX_USED; ++s) {
+            if (s < n_used) {
+                float r = de[s];          // mmvq epilogue: per-expert scale, zero bias
+                r *= ds[s];
+                r += fzero;
+                if (s == 0) {
+                    sum = (r * es[0]) * ws[0];
+                } else {
+                    sum += (r * es[s]) * ws[s];
+                }
             }
         }
         float sh = tsh;
@@ -1503,6 +1523,366 @@ static bool frt_moeffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     return true;
 }
 
+// ---- decode attention (FRT window ATTNDEC) --------------------------------
+// M = 1 attention over the f16 KV cache, GQA-shared: one CTA per (KV head,
+// KV chunk) computes all query heads of that KV head with m16n8k16 tensor-core
+// MMAs (the query heads are the M rows), so K and V are read once per KV head
+// instead of once per query head. Fully masked chunks (most of a sliding-
+// window cache) exit after reading the mask. A combine kernel merges the
+// chunk partials and the learned attention sinks.
+// Numerics: Q, K, V and P in f16, QK and PV accumulated in f32, softmax in
+// f32. ggml's vector kernel keeps Q (pre-scaled) and the PV accumulator in
+// f16, so the two are not bit-identical: this window is gated by the
+// decode-path KLD/text protocol, not by bitwise parity.
+
+static constexpr int FRT_FA_D   = 128;   // head size (pinned)
+static constexpr int FRT_FA_G   = 8;     // query heads per KV head (pinned)
+static constexpr int FRT_FA_NW  = 4;     // warps per CTA, 16 tokens each per step
+static constexpr int FRT_FA_STEP = FRT_FA_NW * 16;   // KV rows per CTA step
+static constexpr int FRT_FA_MAX_SPLITS = 512;
+
+static __device__ __forceinline__ void frt_mma_16816(float (&c)[4], const uint32_t (&a)[4], const uint32_t b0, const uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+static __device__ __forceinline__ void frt_ldsm_x4(uint32_t (&r)[4], const void * p) {
+    const uint32_t s = (uint32_t) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+
+static __device__ __forceinline__ void frt_ldsm_x4_t(uint32_t (&r)[4], const void * p) {
+    const uint32_t s = (uint32_t) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+
+static __device__ __forceinline__ void frt_cp_async16(void * dst, const void * src) {
+    const uint32_t s = (uint32_t) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(s), "l"(src));
+}
+
+static __device__ __forceinline__ uint32_t frt_h2(const float a, const float b) {
+    const half2 h = __floats2half2_rn(a, b);
+    return *(const uint32_t *) &h;
+}
+
+// smem row pitch (halves) for a 128-wide f16 row: +8 halves breaks ldmatrix bank conflicts
+static constexpr int FRT_FA_PITCH = FRT_FA_D + 8;
+
+// partial for (query head, chunk): running max, sum and unnormalized output
+struct frt_fa_part { float m, l; };
+
+template <int R, bool PF>
+static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode(
+        const float * Q, const int64_t q_head_stride,           // f32 [D] per query head
+        const char * K, const char * V, const int64_t kv_row, const int64_t kv_head,   // f16 rows
+        const half * mask, const float scale, const int n_kv,
+        frt_fa_part * part_ml, float * part_o, const int n_split) {
+    constexpr int D = FRT_FA_D;
+    constexpr int CH = FRT_FA_STEP * R;   // KV rows per CTA
+    __shared__ __align__(16) half sK[FRT_FA_STEP][FRT_FA_PITCH];
+    __shared__ __align__(16) half sV[FRT_FA_STEP][FRT_FA_PITCH];
+    __shared__ float sm_m[FRT_FA_NW][FRT_FA_G], sm_l[FRT_FA_NW][FRT_FA_G];
+    __shared__ int any_live;
+    ggml_cuda_pdl_lc();
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int split = blockIdx.x, g = blockIdx.y;
+    const int t0 = split * CH;
+    const char * Kg = K + (int64_t) g * kv_head;
+    const char * Vg = V + (int64_t) g * kv_head;
+    // older KV rows are already final; the newest row is written by the
+    // previous kernel, and L2 prefetches stay coherent with that write
+    for (int t = threadIdx.x; PF && t < CH && t0 + t < n_kv; t += FRT_FA_NW * WARP_SIZE) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(Kg + (int64_t) (t0 + t) * kv_row));
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(Kg + (int64_t) (t0 + t) * kv_row + 128));
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(Vg + (int64_t) (t0 + t) * kv_row));
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(Vg + (int64_t) (t0 + t) * kv_row + 128));
+    }
+    ggml_cuda_pdl_sync();
+    if (threadIdx.x == 0) {
+        any_live = 0;
+    }
+    __syncthreads();
+    {
+        bool live = false;
+        for (int t = threadIdx.x; t < CH && t0 + t < n_kv; t += FRT_FA_NW * WARP_SIZE) {
+            live |= __half2float(mask[t0 + t]) != -INFINITY;
+        }
+        if (live) {
+            any_live = 1;
+        }
+    }
+    __syncthreads();
+    frt_fa_part * pml = part_ml + (int64_t) (g * FRT_FA_G) * n_split + split;
+    if (!any_live) {   // fully masked chunk
+        if (threadIdx.x < FRT_FA_G) {
+            pml[(int64_t) threadIdx.x * n_split] = { -INFINITY, 0.0f };
+        }
+        return;
+    }
+    // Q fragments (A operand, 16 rows: query heads 0..7 then zero padding), all 8 k-steps
+    uint32_t qa[D / 16][2];   // rows 0..7 only: {a0a1, a4a5}; a2a3 / a6a7 are the zero pad rows
+    {
+        const float * q = Q + (int64_t) (g * FRT_FA_G + lane / 4) * q_head_stride;
+#pragma unroll
+        for (int kk = 0; kk < D / 16; ++kk) {
+            const int c = kk * 16 + (lane % 4) * 2;
+            qa[kk][0] = frt_h2(q[c], q[c + 1]);
+            qa[kk][1] = frt_h2(q[c + 8], q[c + 9]);
+        }
+    }
+    float m_run = -INFINITY, l_run = 0.0f;   // for query head lane/4 (row of the C fragments)
+    float o[D / 8][2];                        // O rows 0..7: dims tile j, cols (lane%4)*2 + {0,1}
+#pragma unroll
+    for (int j = 0; j < D / 8; ++j) {
+        o[j][0] = o[j][1] = 0.0f;
+    }
+    for (int it = 0; it < R; ++it) {
+        const int tb = t0 + it * FRT_FA_STEP;
+        if (tb >= n_kv) {
+            break;
+        }
+        __syncthreads();   // previous step's smem reads done
+        // stage K and V rows [tb, tb + STEP): 16 B per cp.async, 16 per row
+        for (int c = threadIdx.x; c < FRT_FA_STEP * (D / 8); c += FRT_FA_NW * WARP_SIZE) {
+            const int r = c / (D / 8), cc = (c % (D / 8)) * 8;
+            const int64_t off = (int64_t) (tb + r) * kv_row + cc * (int64_t) sizeof(half);
+            frt_cp_async16(&sK[r][cc], Kg + off);
+            frt_cp_async16(&sV[r][cc], Vg + off);
+        }
+        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+        // S = Q K^T for this warp's 16 rows: two n8 tiles x 8 k-steps
+        const int wr = warp * 16;   // first KV row of the warp (in the step)
+        float s[2][4];
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+        }
+#pragma unroll
+        for (int kk = 0; kk < D / 16; ++kk) {
+            // x4: matrices (rows wr..+7, k lo), (rows wr..+7, k hi), (rows wr+8..+15, k lo), (rows wr+8.., k hi)
+            uint32_t kb[4];
+            const int mat = lane / 8, r8 = lane % 8;
+            frt_ldsm_x4(kb, &sK[wr + (mat / 2) * 8 + r8][kk * 16 + (mat % 2) * 8]);
+            const uint32_t a[4] = { qa[kk][0], 0u, qa[kk][1], 0u };
+            frt_mma_16816(s[0], a, kb[0], kb[1]);
+            frt_mma_16816(s[1], a, kb[2], kb[3]);
+        }
+        // scale + mask; columns of the C fragment are KV rows, rows are query heads
+        float mx = -INFINITY;
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int t = tb + wr + n * 8 + (lane % 4) * 2 + e;
+                const float mv = __half2float(mask[t]);
+                s[n][e] = s[n][e] * scale + mv;
+                mx = fmaxf(mx, s[n][e]);
+            }
+        }
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+        const float m_new = fmaxf(m_run, mx);
+        const float corr = m_new == -INFINITY ? 1.0f : expf(m_run - m_new);
+        float ps = 0.0f;
+        float p[2][2];
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                p[n][e] = m_new == -INFINITY ? 0.0f : expf(s[n][e] - m_new);
+                ps += p[n][e];
+            }
+        }
+        ps += __shfl_xor_sync(0xffffffff, ps, 1);
+        ps += __shfl_xor_sync(0xffffffff, ps, 2);
+        l_run = l_run * corr + ps;
+        m_run = m_new;
+#pragma unroll
+        for (int j = 0; j < D / 8; ++j) {
+            o[j][0] *= corr;
+            o[j][1] *= corr;
+        }
+        // O += P V: A = P (rows = heads, k = the warp's 16 KV rows), B = V tile via ldmatrix.trans
+        const uint32_t pa[4] = { frt_h2(p[0][0], p[0][1]), 0u, frt_h2(p[1][0], p[1][1]), 0u };
+#pragma unroll
+        for (int j2 = 0; j2 < D / 16; ++j2) {
+            // x4.trans: (k rows wr..+7, dims j lo), (k rows wr+8..+15, dims j lo), (wr.., dims hi), (wr+8.., dims hi)
+            uint32_t vb[4];
+            const int mat = lane / 8, r8 = lane % 8;
+            frt_ldsm_x4_t(vb, &sV[wr + (mat % 2) * 8 + r8][j2 * 16 + (mat / 2) * 8]);
+            float c0[4] = { o[2 * j2][0], o[2 * j2][1], 0.0f, 0.0f };
+            float c1[4] = { o[2 * j2 + 1][0], o[2 * j2 + 1][1], 0.0f, 0.0f };
+            frt_mma_16816(c0, pa, vb[0], vb[1]);
+            frt_mma_16816(c1, pa, vb[2], vb[3]);
+            o[2 * j2][0] = c0[0]; o[2 * j2][1] = c0[1];
+            o[2 * j2 + 1][0] = c1[0]; o[2 * j2 + 1][1] = c1[1];
+        }
+    }
+    // merge the 4 warps' (m, l, O) for each query head
+    if (lane % 4 == 0) {
+        sm_m[warp][lane / 4] = m_run;
+        sm_l[warp][lane / 4] = l_run;
+    }
+    __syncthreads();
+    float * so = (float *) &sK[0][0];   // reuse: [NW][G][D] f32 = 16 KB
+    const int h = lane / 4;
+    float M = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < FRT_FA_NW; ++w) {
+        M = fmaxf(M, sm_m[w][h]);
+    }
+    const float f = M == -INFINITY ? 0.0f : expf(m_run - M);
+#pragma unroll
+    for (int j = 0; j < D / 8; ++j) {
+        const int d = j * 8 + (lane % 4) * 2;
+        so[(warp * FRT_FA_G + h) * D + d]     = o[j][0] * f;
+        so[(warp * FRT_FA_G + h) * D + d + 1] = o[j][1] * f;
+    }
+    __syncthreads();
+    // thread -> (head, 4 dims): 8 heads x 128 dims over 128 threads
+    for (int idx = threadIdx.x; idx < FRT_FA_G * D; idx += FRT_FA_NW * WARP_SIZE) {
+        const int hh = idx / D, d = idx % D;
+        float acc = 0.0f;
+#pragma unroll
+        for (int w = 0; w < FRT_FA_NW; ++w) {
+            acc += so[(w * FRT_FA_G + hh) * D + d];
+        }
+        part_o[((int64_t) (g * FRT_FA_G + hh) * n_split + split) * D + d] = acc;
+    }
+    if (threadIdx.x < FRT_FA_G) {
+        const int hh = threadIdx.x;
+        float MM = -INFINITY, L = 0.0f;
+#pragma unroll
+        for (int w = 0; w < FRT_FA_NW; ++w) {
+            MM = fmaxf(MM, sm_m[w][hh]);
+        }
+#pragma unroll
+        for (int w = 0; w < FRT_FA_NW; ++w) {
+            L += MM == -INFINITY ? 0.0f : sm_l[w][hh] * expf(sm_m[w][hh] - MM);
+        }
+        pml[(int64_t) hh * n_split] = { MM, L };
+    }
+}
+
+// one CTA per query head, one thread per dim: merge chunk partials + sink.
+// The max / denominator over the splits are reduced by the whole CTA first.
+static __global__ void frt_fa_combine(const frt_fa_part * part_ml, const float * part_o, const float * sinks,
+        float * dst, const int64_t dst_head_stride, const int n_split) {
+    ggml_cuda_pdl_lc();
+    constexpr int D = FRT_FA_D;
+    __shared__ float red[D / WARP_SIZE];
+    __shared__ float sM, sL;
+    __shared__ float wsc[FRT_FA_MAX_SPLITS];
+    const int h = blockIdx.x, d = threadIdx.x, lane = d % WARP_SIZE, warp = d / WARP_SIZE;
+    ggml_cuda_pdl_sync();
+    const frt_fa_part * pm = part_ml + (int64_t) h * n_split;
+    float m = -INFINITY;
+    for (int j = d; j < n_split; j += D) {
+        m = fmaxf(m, pm[j].m);
+    }
+    m = warp_reduce_max(m);
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    if (d == 0) {
+        float M = sinks ? sinks[h] : -INFINITY;
+        for (int w = 0; w < D / WARP_SIZE; ++w) M = fmaxf(M, red[w]);
+        sM = M;
+    }
+    __syncthreads();
+    const float M = sM;
+    float l = 0.0f;
+    for (int j = d; j < n_split; j += D) {
+        const frt_fa_part q = pm[j];
+        const float f = q.m == -INFINITY ? 0.0f : expf(q.m - M);
+        wsc[j] = f;
+        l += q.l * f;
+    }
+    l = warp_reduce_sum(l);
+    __syncthreads();
+    if (lane == 0) red[warp] = l;
+    __syncthreads();
+    if (d == 0) {
+        float L = sinks ? expf(sinks[h] - M) : 0.0f;
+        for (int w = 0; w < D / WARP_SIZE; ++w) L += red[w];
+        sL = L;
+    }
+    __syncthreads();
+    const float * po = part_o + (int64_t) h * n_split * D + d;
+    float acc = 0.0f;
+#pragma unroll 4
+    for (int j = 0; j < n_split; ++j) {
+        acc += po[(int64_t) j * D] * wsc[j];
+    }
+    dst[(int64_t) h * dst_head_stride + d] = acc / sL;
+}
+
+static frt_fa_part * g_fa_ml = nullptr;
+static float * g_fa_o = nullptr;
+static constexpr int FRT_FA_HEADS_MAX = 64;
+
+static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
+    static const bool on = frt_layer_enabled() && getenv("FRT_ATTNDEC") && getenv("FRT_ATTNDEC")[0] == '1';
+    if (!on || g_fa_ml == nullptr) return false;
+    ggml_tensor * fa = cgraph->nodes[i];
+    if (fa->op != GGML_OP_FLASH_ATTN_EXT) return false;
+    // the fuse hook treats a 1-node window as "not fused" and would run the
+    // stock kernel over our output: consume the pure-view reshape that follows
+    if (i + 1 >= cgraph->n_nodes) return false;
+    const ggml_tensor * nxt = cgraph->nodes[i + 1];
+    if ((nxt->op != GGML_OP_RESHAPE && nxt->op != GGML_OP_VIEW) || nxt->src[0] != fa) return false;
+    const ggml_tensor * Q = fa->src[0], * K = fa->src[1], * V = fa->src[2], * mask = fa->src[3], * sinks = fa->src[4];
+    // Q [D, 1 token, H], K/V [D, n_kv, Hkv] f16 views of the cache, mask [n_kv, >=1] f16
+    if (Q->type != GGML_TYPE_F32 || Q->ne[0] != FRT_FA_D || Q->ne[1] != 1 || Q->ne[3] != 1 || Q->nb[0] != sizeof(float)) return false;
+    if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || K->ne[0] != FRT_FA_D || V->ne[0] != FRT_FA_D) return false;
+    if (K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) || K->nb[1] != V->nb[1] || K->nb[2] != V->nb[2]) return false;
+    if (K->ne[1] != V->ne[1] || K->ne[2] != V->ne[2] || K->ne[3] != 1 || Q->ne[2] != K->ne[2] * FRT_FA_G) return false;
+    if (Q->ne[2] > FRT_FA_HEADS_MAX) return false;
+    if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->nb[0] != sizeof(half)) return false;
+    if (sinks && (sinks->type != GGML_TYPE_F32 || ggml_nelements(sinks) != Q->ne[2])) return false;
+    if (fa->type != GGML_TYPE_F32 || fa->ne[0] != FRT_FA_D || !ggml_is_contiguous(fa)) return false;
+    float scale, max_bias, softcap;
+    memcpy(&scale,    (const float *) fa->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) fa->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) fa->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || softcap != 0.0f) return false;
+    const int n_kv = (int) K->ne[1];
+    if (n_kv % FRT_FA_STEP != 0) return false;   // the cache view is padded to 256 rows
+    if (((uintptr_t) K->data | (uintptr_t) V->data | (size_t) K->nb[1] | (size_t) K->nb[2]) & 15) return false;
+    // tokens per CTA: aim for ~2 CTAs per SM over the KV heads, at most MAX_SPLITS chunks
+    static const int target_splits = getenv("FRT_ATTNDEC_SPLITS") ? atoi(getenv("FRT_ATTNDEC_SPLITS")) : 96;
+    int R = 1;
+    while (R < 16 && ((n_kv + FRT_FA_STEP * R - 1) / (FRT_FA_STEP * R) > target_splits ||
+                      (n_kv + FRT_FA_STEP * R - 1) / (FRT_FA_STEP * R) > FRT_FA_MAX_SPLITS)) R *= 2;
+    if ((n_kv + FRT_FA_STEP * R - 1) / (FRT_FA_STEP * R) > FRT_FA_MAX_SPLITS) return false;
+    const int n_split = (n_kv + FRT_FA_STEP * R - 1) / (FRT_FA_STEP * R);
+    cudaStream_t stream = ctx.stream();
+    const dim3 grid((unsigned) n_split, (unsigned) K->ne[2]);
+    const ggml_cuda_kernel_launch_params lp(grid, (dim3) (FRT_FA_NW * WARP_SIZE), 0, stream);
+    auto launch = [&](auto kernel) {
+        ggml_cuda_kernel_launch(kernel, lp, (const float *) Q->data, (int64_t) (Q->nb[2] / sizeof(float)),
+            (const char *) K->data, (const char *) V->data, (int64_t) K->nb[1], (int64_t) K->nb[2],
+            (const half *) mask->data, scale, n_kv, g_fa_ml, g_fa_o, n_split);
+    };
+    static const bool pf = !(getenv("FRT_ATTNDEC_PF") && getenv("FRT_ATTNDEC_PF")[0] == '0');   // measured: prefetch on is faster
+    switch (R) {
+        case 1:  pf ? launch(frt_fa_decode<1, true>)  : launch(frt_fa_decode<1, false>);  break;
+        case 2:  pf ? launch(frt_fa_decode<2, true>)  : launch(frt_fa_decode<2, false>);  break;
+        case 4:  pf ? launch(frt_fa_decode<4, true>)  : launch(frt_fa_decode<4, false>);  break;
+        case 8:  pf ? launch(frt_fa_decode<8, true>)  : launch(frt_fa_decode<8, false>);  break;
+        default: pf ? launch(frt_fa_decode<16, true>) : launch(frt_fa_decode<16, false>); break;
+    }
+    ggml_cuda_kernel_launch(frt_fa_combine, ggml_cuda_kernel_launch_params((dim3) (unsigned) Q->ne[2], (dim3) FRT_FA_D, 0, stream),
+        (const frt_fa_part *) g_fa_ml, (const float *) g_fa_o, sinks ? (const float *) sinks->data : (const float *) nullptr,
+        (float *) fa->data, (int64_t) (fa->nb[1] / sizeof(float)), n_split);
+    *skip_count = 2;
+    return true;
+}
+
 // ---- entry points called from the host's ggml-cuda.cu ---------------------
 
 bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
@@ -1512,6 +1892,7 @@ bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     if (frt_attnqkv_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_route_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_oproj_try(ctx, cgraph, i, skip_count)) return true;
+    if (frt_attndec_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_moeffn_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_amax_try(ctx, cgraph, i, skip_count)) return true;
     return false;
@@ -1532,5 +1913,7 @@ void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
         CUDA_CHECK(cudaMalloc(&g_moe_tail.esc, FRT_MOE_MAX_USED * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_moe_tail.ids, FRT_MOE_MAX_USED * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&g_moe_tail.wts, FRT_MOE_MAX_USED * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_fa_ml, (size_t) FRT_FA_HEADS_MAX * FRT_FA_MAX_SPLITS * sizeof(frt_fa_part)));
+        CUDA_CHECK(cudaMalloc(&g_fa_o, (size_t) FRT_FA_HEADS_MAX * FRT_FA_MAX_SPLITS * FRT_FA_D * sizeof(float)));
     }
 }
