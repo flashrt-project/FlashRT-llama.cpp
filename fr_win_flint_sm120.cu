@@ -911,6 +911,164 @@ static bool frt_oproj_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
     return true;
 }
 
+// ---- dense FFN (FRT window DENSEFFN, the leading dense layers) ----------------
+// ffn RMSNorm -> q8_1 -> gate / up GEMV (+ scales) -> SwiGLU -> q8_1 -> down
+// GEMV (+ scale) -> residual add: 6 stock launches (rms_norm, quantize, the
+// fused gate/up/GLU mmvq, quantize, mmvq, add) -> 2.
+
+static constexpr int FRT_DFF = 6144;   // pinned: dense FFN width
+static float * g_dense_glu = nullptr;
+
+// mmvq row dot, K = 6144 (96 blocks): ggml's 4 warps start at blocks lane/2 +
+// 16 w and step by 64, so warps 0/1 cover two blocks per lane pair and warps
+// 2/3 one; the warp partials are summed in warp order before the butterfly.
+// b[j] = this lane's share of block lane/2 + 16 j (j = 0..5).
+static __device__ __forceinline__ float frt_rowdot_k6144(const frt_nvb (&b)[6], const block_q8_1 * y, const int lane, const float fzero) {
+    const int kb = lane / 2, iqs = frt_lane_iqs(lane);
+    float t0 = fzero + frt_vd(b[0], y + 2 * kb, iqs);
+    t0 += frt_vd(b[4], y + 2 * (kb + 64), iqs);
+    float t1 = fzero + frt_vd(b[1], y + 2 * (kb + 16), iqs);
+    t1 += frt_vd(b[5], y + 2 * (kb + 80), iqs);
+    const float t2 = fzero + frt_vd(b[2], y + 2 * (kb + 32), iqs);
+    const float t3 = fzero + frt_vd(b[3], y + 2 * (kb + 48), iqs);
+    float t = t0;
+    t += t1;
+    t += t2;
+    t += t3;
+    return warp_reduce_sum(t);
+}
+
+// K1: one warp per GLU output row; every CTA recomputes the (exact) RMSNorm
+// and q8_1 of the activation, as the attention front does.
+template <int NW>
+static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_dense_gu(
+        const float * x, const float * norm_w, const float eps,
+        const char * gw, const char * uw, const size_t row_stride, const float * gs, const float * us,
+        float * glu, const int n_ff, const float fzero) {
+    ggml_cuda_pdl_lc();
+    __shared__ float xn[FRT_K_EMBD];
+    __shared__ float red[32];
+    __shared__ block_q8_1 yq[FRT_K_EMBD / QK8_1];
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int r = blockIdx.x * NW + warp;
+    const bool active = r < n_ff;
+    frt_nvb bg[2], bu[2];
+    float sg = 0.0f, su = 0.0f;
+    if (active) {   // weights and scales are immutable: fetch before the dependency wait
+        frt_ld_row<2>(bg, gw + (size_t) r * row_stride, lane);
+        frt_ld_row<2>(bu, uw + (size_t) r * row_stride, lane);
+        sg = gs[0];
+        su = us[0];
+    }
+    ggml_cuda_pdl_sync();
+    frt_rms_norm_2048<NW>(x, norm_w, eps, xn, red, FRT_K_EMBD);
+    __syncthreads();
+    for (int c = warp; c < FRT_K_EMBD / QK8_1; c += NW) {
+        frt_q8_1_chunk(xn[c * QK8_1 + lane], lane, &yq[c]);
+    }
+    __syncthreads();
+    if (!active) {
+        return;
+    }
+    const float tg = frt_rowdot_k2048(bg, yq, lane, fzero);
+    const float tu = frt_rowdot_k2048(bu, yq, lane, fzero);
+    if (lane == 0) {   // mmvq fused epilogue: x = up, gate = gate, SwiGLU
+        float result = tu;
+        result *= su;
+        result += fzero;
+        float gate_value = tg;
+        gate_value *= sg;
+        gate_value += fzero;
+        result *= ggml_cuda_op_silu_single(gate_value);
+        glu[r] = result;
+    }
+}
+
+// K2: one warp per output row; every CTA quantizes the GLU row to q8_1 (as
+// the output projection does for its input), then down GEMV, scale, residual.
+template <int NW>
+static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_dense_down(
+        const float * glu, const char * dw, const size_t row_stride, const float * ds,
+        const float * resid, float * out, const int n_out, const float fzero) {
+    ggml_cuda_pdl_lc();
+    __shared__ block_q8_1 yq[FRT_DFF / QK8_1];
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int r = blockIdx.x * NW + warp;
+    const bool active = r < n_out;
+    frt_nvb b[6];
+    float sc = 0.0f;
+    if (active) {
+        frt_ld_row<6>(b, dw + (size_t) r * row_stride, lane);
+        sc = ds[0];
+    }
+    ggml_cuda_pdl_sync();
+    static_assert((FRT_DFF / QK8_1) % NW == 0, "chunks per warp");
+    frt_q8_1_chunks<FRT_DFF / QK8_1 / NW>(glu, yq, warp, NW, lane);
+    __syncthreads();
+    if (!active) {
+        return;
+    }
+    const float t = frt_rowdot_k6144(b, yq, lane, fzero);
+    if (lane == 0) {
+        float result = t;   // mmvq epilogue: scale, zero bias
+        result *= sc;
+        result += fzero;
+        float o = result;   // k_bin_bcast add
+        o = o + resid[r];
+        out[r] = o;
+    }
+}
+
+// anchor: RMS_NORM -> MUL(ffn_norm) -> MUL_MAT(ffn_gate) -> MUL(s) -> MUL_MAT(ffn_up)
+// -> MUL(s) -> GLU(swiglu) -> MUL_MAT(ffn_down) -> MUL(s) -> ADD(residual), M = 1.
+static bool frt_denseffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
+    static const bool on = frt_window_on("GGML_FLASHRT_NO_DENSEFFN");
+    if (!on || g_dense_glu == nullptr || i + 9 >= cgraph->n_nodes) return false;
+    ggml_tensor * const * n = cgraph->nodes + i;
+    const ggml_tensor * rn = n[0], * nm = n[1], * gm = n[2], * gsm = n[3], * um = n[4], * usm = n[5];
+    const ggml_tensor * glu = n[6], * dm = n[7], * dsm = n[8];
+    ggml_tensor * add = n[9];
+    if (rn->op != GGML_OP_RMS_NORM || nm->op != GGML_OP_MUL || nm->src[0] != rn || !strstr(nm->src[1]->name, ".ffn_norm.weight")) return false;
+    if (gm->op != GGML_OP_MUL_MAT || gm->src[1] != nm || !strstr(gm->src[0]->name, ".ffn_gate.weight")) return false;
+    if (um->op != GGML_OP_MUL_MAT || um->src[1] != nm || !strstr(um->src[0]->name, ".ffn_up.weight")) return false;
+    const ggml_tensor * gs = frt_mm_scale_src(gsm, gm), * us = frt_mm_scale_src(usm, um);
+    if (!gs || !us) return false;
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->src[0] != gsm || glu->src[1] != usm) return false;
+    if (dm->op != GGML_OP_MUL_MAT || dm->src[1] != glu || !strstr(dm->src[0]->name, ".ffn_down.weight")) return false;
+    const ggml_tensor * ds = frt_mm_scale_src(dsm, dm);
+    if (!ds || add->op != GGML_OP_ADD || add->src[0] != dsm) return false;
+    const ggml_tensor * x = rn->src[0], * nw = nm->src[1], * resid = add->src[1];
+    const ggml_tensor * gw = gm->src[0], * uw = um->src[0], * dw = dm->src[0];
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || ggml_nrows(x) != 1 || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
+    if (nw->type != GGML_TYPE_F32 || nw->ne[0] != FRT_K_EMBD || ggml_nrows(nw) != 1 || !ggml_is_contiguous(nw) || !frt_aligned16(nw->data)) return false;
+    if (nm->ne[0] != FRT_K_EMBD || ggml_nrows(nm) != 1) return false;
+    for (const ggml_tensor * w : { gw, uw }) {
+        if (w->type != GGML_TYPE_NVFP4 || w->ne[0] != FRT_K_EMBD || w->ne[1] != FRT_DFF || !ggml_is_contiguous(w) || w->nb[1] != gw->nb[1]) return false;
+    }
+    if (dw->type != GGML_TYPE_NVFP4 || dw->ne[0] != FRT_DFF || dw->ne[1] != FRT_K_EMBD || !ggml_is_contiguous(dw)) return false;
+    if (resid->type != GGML_TYPE_F32 || resid->ne[0] != FRT_K_EMBD || ggml_nrows(resid) != 1 || !ggml_is_contiguous(resid)) return false;
+    if (add->type != GGML_TYPE_F32 || add->ne[0] != FRT_K_EMBD || ggml_nrows(add) != 1 || !ggml_is_contiguous(add)) return false;
+    // K2 thread r reads resid[r] before writing out[r]: an exact alias is safe, a partial one is not
+    if (add->data != resid->data && frt_overlap(add, resid)) return false;
+    if (!frt_span_closed(cgraph, i, i + 9, {})) return false;
+    float eps;
+    memcpy(&eps, rn->op_params, sizeof(float));
+    cudaStream_t stream = ctx.stream();
+    static const int nw_gu = frt_cfg_nw("FRT_NW_DGU", 16);
+    static const int nw_dn = frt_cfg_nw("FRT_NW_DDOWN", 16);
+    FRT_NW_DISPATCH(nw_gu,
+        ggml_cuda_kernel_launch(frt_dense_gu<NWT>, ggml_cuda_kernel_launch_params((dim3) ((FRT_DFF + NWT - 1) / NWT), (dim3) (NWT * WARP_SIZE), 0, stream),
+            (const float *) x->data, (const float *) nw->data, eps, (const char *) gw->data, (const char *) uw->data, (size_t) gw->nb[1],
+            (const float *) gs->data, (const float *) us->data, g_dense_glu, FRT_DFF, 0.0f));
+    FRT_NW_DISPATCH(nw_dn,
+        ggml_cuda_kernel_launch(frt_dense_down<NWT>, ggml_cuda_kernel_launch_params((dim3) ((FRT_K_EMBD + NWT - 1) / NWT), (dim3) (NWT * WARP_SIZE), 0, stream),
+            (const float *) g_dense_glu, (const char *) dw->data, (size_t) dw->nb[1], (const float *) ds->data,
+            (const float *) resid->data, (float *) add->data, FRT_K_EMBD, 0.0f));
+    *skip_count = 10;
+    return true;
+}
+
 // ---- MoE routing (FRT window ROUTE) -----------------------------------------
 // ffn RMSNorm -> router GEMV (BF16) -> sigmoid top-k with weight
 // normalization: 3 stock launches -> 1. One CTA per router row as in
@@ -2100,6 +2258,7 @@ bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     if (!cc_ok) return false;
     if (frt_attnqkv_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_route_try(ctx, cgraph, i, skip_count)) return true;
+    if (frt_denseffn_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_oproj_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_attndec_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_moeffn_try(ctx, cgraph, i, skip_count)) return true;
@@ -2114,6 +2273,7 @@ void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
         ggml_cuda_set_device(ctx.device);
         CUDA_CHECK(cudaMalloc(&g_moe_glu, FRT_MOE_GLU_CAP * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_qkv, FRT_QKV_ROWS_MAX * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_dense_glu, FRT_DFF * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_route_logits, 256 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_route_count, sizeof(unsigned int)));
         CUDA_CHECK(cudaMemset(g_route_count, 0, sizeof(unsigned int)));
