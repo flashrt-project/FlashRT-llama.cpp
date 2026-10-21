@@ -16,6 +16,7 @@
 #include "unary.cuh"
 
 #include <algorithm>
+#include <vector>
 #include <cstdint>
 #include <cstdio>
 #include <initializer_list>
@@ -1530,10 +1531,14 @@ static bool frt_moeffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
 // instead of once per query head. Fully masked chunks (most of a sliding-
 // window cache) exit after reading the mask. A combine kernel merges the
 // chunk partials and the learned attention sinks.
-// Numerics: Q, K, V and P in f16, QK and PV accumulated in f32, softmax in
-// f32. ggml's vector kernel keeps Q (pre-scaled) and the PV accumulator in
-// f16, so the two are not bit-identical: this window is gated by the
-// decode-path KLD/text protocol, not by bitwise parity.
+// Numerics: ggml's vector kernel (NVIDIA path) works in f32 on the f16
+// cache: f32 Q, f32 scores, f32 P and f32 PV accumulation. The MMAs here
+// take f16 operands, so Q and P are split into f16 hi + lo parts. The M
+// rows 8..15 of the m16n8k16 A fragment (padding with 8 query heads) carry
+// the lo parts, and C rows h and h+8 are summed. This gives ~f32-level
+// operand precision at no extra MMA cost. The summation order differs from
+// ggml's, so the window is gated by the decode-path PPL/KLD protocol, not
+// by bitwise parity.
 
 static constexpr int FRT_FA_D   = 128;   // head size (pinned)
 static constexpr int FRT_FA_G   = 8;     // query heads per KV head (pinned)
@@ -1564,9 +1569,12 @@ static __device__ __forceinline__ void frt_cp_async16(void * dst, const void * s
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(s), "l"(src));
 }
 
-static __device__ __forceinline__ uint32_t frt_h2(const float a, const float b) {
+// f32 pair -> f16 hi + f16 lo (hi + lo == x up to ~2^-22 relative)
+static __device__ __forceinline__ void frt_h2_split(const float a, const float b, uint32_t & hi, uint32_t & lo) {
     const half2 h = __floats2half2_rn(a, b);
-    return *(const uint32_t *) &h;
+    const half2 l = __floats2half2_rn(a - __low2float(h), b - __high2float(h));
+    hi = *(const uint32_t *) &h;
+    lo = *(const uint32_t *) &l;
 }
 
 // smem row pitch (halves) for a 128-wide f16 row: +8 halves breaks ldmatrix bank conflicts
@@ -1623,15 +1631,15 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
         }
         return;
     }
-    // Q fragments (A operand, 16 rows: query heads 0..7 then zero padding), all 8 k-steps
-    uint32_t qa[D / 16][2];   // rows 0..7 only: {a0a1, a4a5}; a2a3 / a6a7 are the zero pad rows
+    // Q fragments (A operand): rows 0..7 = f16 hi of query heads 0..7, rows 8..15 = f16 lo
+    uint32_t qa[D / 16][4];   // {a0a1 (hi, k lo), a2a3 (lo, k lo), a4a5 (hi, k hi), a6a7 (lo, k hi)}
     {
         const float * q = Q + (int64_t) (g * FRT_FA_G + lane / 4) * q_head_stride;
 #pragma unroll
         for (int kk = 0; kk < D / 16; ++kk) {
             const int c = kk * 16 + (lane % 4) * 2;
-            qa[kk][0] = frt_h2(q[c], q[c + 1]);
-            qa[kk][1] = frt_h2(q[c + 8], q[c + 9]);
+            frt_h2_split(q[c],     q[c + 1], qa[kk][0], qa[kk][1]);
+            frt_h2_split(q[c + 8], q[c + 9], qa[kk][2], qa[kk][3]);
         }
     }
     float m_run = -INFINITY, l_run = 0.0f;   // for query head lane/4 (row of the C fragments)
@@ -1668,9 +1676,14 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
             uint32_t kb[4];
             const int mat = lane / 8, r8 = lane % 8;
             frt_ldsm_x4(kb, &sK[wr + (mat / 2) * 8 + r8][kk * 16 + (mat % 2) * 8]);
-            const uint32_t a[4] = { qa[kk][0], 0u, qa[kk][1], 0u };
-            frt_mma_16816(s[0], a, kb[0], kb[1]);
-            frt_mma_16816(s[1], a, kb[2], kb[3]);
+            frt_mma_16816(s[0], qa[kk], kb[0], kb[1]);
+            frt_mma_16816(s[1], qa[kk], kb[2], kb[3]);
+        }
+        // Q.K = hi row + lo row
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            s[n][0] += s[n][2];
+            s[n][1] += s[n][3];
         }
         // scale + mask; columns of the C fragment are KV rows, rows are query heads
         float mx = -INFINITY;
@@ -1707,8 +1720,11 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
             o[j][0] *= corr;
             o[j][1] *= corr;
         }
-        // O += P V: A = P (rows = heads, k = the warp's 16 KV rows), B = V tile via ldmatrix.trans
-        const uint32_t pa[4] = { frt_h2(p[0][0], p[0][1]), 0u, frt_h2(p[1][0], p[1][1]), 0u };
+        // O += P V: A = P (rows 0..7 = heads hi, rows 8..15 = lo; k = the warp's 16 KV rows),
+        // B = V tile via ldmatrix.trans
+        uint32_t pa[4];
+        frt_h2_split(p[0][0], p[0][1], pa[0], pa[1]);
+        frt_h2_split(p[1][0], p[1][1], pa[2], pa[3]);
 #pragma unroll
         for (int j2 = 0; j2 < D / 16; ++j2) {
             // x4.trans: (k rows wr..+7, dims j lo), (k rows wr+8..+15, dims j lo), (wr.., dims hi), (wr+8.., dims hi)
@@ -1719,8 +1735,8 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
             float c1[4] = { o[2 * j2 + 1][0], o[2 * j2 + 1][1], 0.0f, 0.0f };
             frt_mma_16816(c0, pa, vb[0], vb[1]);
             frt_mma_16816(c1, pa, vb[2], vb[3]);
-            o[2 * j2][0] = c0[0]; o[2 * j2][1] = c0[1];
-            o[2 * j2 + 1][0] = c1[0]; o[2 * j2 + 1][1] = c1[1];
+            o[2 * j2][0] = c0[0] + c0[2]; o[2 * j2][1] = c0[1] + c0[3];
+            o[2 * j2 + 1][0] = c1[0] + c1[2]; o[2 * j2 + 1][1] = c1[1] + c1[3];
         }
     }
     // merge the 4 warps' (m, l, O) for each query head
@@ -1821,6 +1837,8 @@ static __global__ void frt_fa_combine(const frt_fa_part * part_ml, const float *
     dst[(int64_t) h * dst_head_stride + d] = acc / sL;
 }
 
+void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 static frt_fa_part * g_fa_ml = nullptr;
 static float * g_fa_o = nullptr;
 static constexpr int FRT_FA_HEADS_MAX = 64;
@@ -1876,9 +1894,31 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
         case 8:  pf ? launch(frt_fa_decode<8, true>)  : launch(frt_fa_decode<8, false>);  break;
         default: pf ? launch(frt_fa_decode<16, true>) : launch(frt_fa_decode<16, false>); break;
     }
+    // FRT_ATTNDEC_CHECK=k (test aid, eager mode only): every k-th call also runs
+    // ggml's kernel on the same inputs and prints the max abs / rel difference
+    static int check = getenv("FRT_ATTNDEC_CHECK") ? atoi(getenv("FRT_ATTNDEC_CHECK")) : 0;
+    static int64_t ncall = 0;
+    float * chk = nullptr;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (check > 0 && cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusNone &&
+        (ncall++ % check) == 0) {
+        CUDA_CHECK(cudaMalloc(&chk, ggml_nbytes(fa)));
+    }
     ggml_cuda_kernel_launch(frt_fa_combine, ggml_cuda_kernel_launch_params((dim3) (unsigned) Q->ne[2], (dim3) FRT_FA_D, 0, stream),
         (const frt_fa_part *) g_fa_ml, (const float *) g_fa_o, sinks ? (const float *) sinks->data : (const float *) nullptr,
-        (float *) fa->data, (int64_t) (fa->nb[1] / sizeof(float)), n_split);
+        chk ? chk : (float *) fa->data, (int64_t) (fa->nb[1] / sizeof(float)), n_split);
+    if (chk) {
+        ggml_cuda_flash_attn_ext(ctx, fa);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<float> a(ggml_nelements(fa)), b(ggml_nelements(fa));
+        CUDA_CHECK(cudaMemcpy(a.data(), chk, ggml_nbytes(fa), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(b.data(), fa->data, ggml_nbytes(fa), cudaMemcpyDeviceToHost));
+        double md = 0, mr = 0, nb = 0;
+        for (size_t k = 0; k < a.size(); ++k) { md = std::max(md, (double) fabsf(a[k] - b[k])); nb = std::max(nb, (double) fabsf(b[k])); }
+        mr = md / std::max(nb, 1e-20);
+        fprintf(stderr, "frt-attndec-check %s n_kv=%d splits=%d R=%d max|d|=%.3g max|ref|=%.3g rel=%.3g\n", fa->name, n_kv, n_split, R, md, nb, mr);
+        CUDA_CHECK(cudaFree(chk));
+    }
     *skip_count = 2;
     return true;
 }
