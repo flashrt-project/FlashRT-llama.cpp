@@ -1903,18 +1903,25 @@ struct frt_fa_part { float m, l; };
 // frt_fa_pending: each CTA normalizes its 8 query heads from g_qkv, and the
 // CTA whose chunk holds the new cache cell writes that row (its KV head)
 // and patches it into its staged tile.
-template <bool PF, int QKN>
+// NS: staged KV tiles in flight per CTA (1: short caches, several CTAs per SM;
+// 2: long caches, double-buffered cp.async with a bounded L2 prefetch
+// distance of pfd tiles ahead). The tiles live in dynamic shared memory.
+static constexpr int FRT_FA_TILE_BYTES = 2 * FRT_FA_STEP * (FRT_FA_D + 8) * (int) sizeof(half);   // K + V
+
+template <bool PF, int QKN, int NS>
 static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode(
         const float * Q, const int64_t q_head_stride,           // f32 [D] per query head
         const char * K, const char * V, const int64_t kv_row, const int64_t kv_head,   // f16 rows
         const half * mask, const float scale, const int n_kv,
         frt_fa_part * part_ml, float * part_o, const int n_split,
-        const float * qkv, const frt_qkn_params qp, const int steps, const bool prestage_ok) {
+        const float * qkv, const frt_qkn_params qp, const int steps, const bool prestage_ok, const int pfd) {
     constexpr int D = FRT_FA_D;
     const int CH = FRT_FA_STEP * steps;   // KV rows per CTA
     const bool prestage = QKN != 0 && prestage_ok;
-    __shared__ __align__(16) half sK[FRT_FA_STEP][FRT_FA_PITCH];
-    __shared__ __align__(16) half sV[FRT_FA_STEP][FRT_FA_PITCH];
+    extern __shared__ __align__(16) char frt_fa_dsm[];
+    typedef half frt_tile_t[FRT_FA_STEP][FRT_FA_PITCH];
+    frt_tile_t * sKb = (frt_tile_t *) frt_fa_dsm;   // [NS] K tiles, then [NS] V tiles
+    frt_tile_t * sVb = sKb + NS;
     __shared__ float sm_m[FRT_FA_NW][FRT_FA_G], sm_l[FRT_FA_NW][FRT_FA_G];
     __shared__ float sQ[QKN ? FRT_FA_G : 1][D];
     __shared__ __align__(16) half sNK[QKN ? D : 8], sNV[QKN ? D : 8];
@@ -1948,17 +1955,17 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
     // step is staged before the dependency wait. Otherwise the new row comes
     // from the previous kernel and only L2 prefetches (coherent with that
     // write) are issued early. Masked rows are not fetched.
-    auto stage = [&](const int tb) {   // K and V rows [tb, tb + STEP): 16 B per cp.async, 16 per row
+    auto stage = [&](const int tb, const int buf) {   // K and V rows [tb, tb + STEP): 16 B per cp.async, 16 per row
         for (int c = threadIdx.x; c < FRT_FA_STEP * (D / 8); c += FRT_FA_NW * WARP_SIZE) {
             const int r = c / (D / 8), cc = (c % (D / 8)) * 8;
             const int64_t off = (int64_t) (tb + r) * kv_row + cc * (int64_t) sizeof(half);
-            frt_cp_async16(&sK[r][cc], Kg + off);
-            frt_cp_async16(&sV[r][cc], Vg + off);
+            frt_cp_async16(&sKb[buf][r][cc], Kg + off);
+            frt_cp_async16(&sVb[buf][r][cc], Vg + off);
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
-    if (chunk_live) {
-        for (int t = prestage ? FRT_FA_STEP + threadIdx.x : threadIdx.x; PF && t < CH && t0 + t < n_kv; t += FRT_FA_NW * WARP_SIZE) {
+    auto l2_rows = [&](const int r0, const int r1) {   // L2 prefetch of the live rows [r0, r1) of the chunk
+        for (int t = r0 + threadIdx.x; t < r1 && t < CH && t0 + t < n_kv; t += FRT_FA_NW * WARP_SIZE) {
             if (__half2float(mask[t0 + t]) == -INFINITY) {
                 continue;
             }
@@ -1967,8 +1974,15 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
             asm volatile("prefetch.global.L2 [%0];" :: "l"(Vg + (int64_t) (t0 + t) * kv_row));
             asm volatile("prefetch.global.L2 [%0];" :: "l"(Vg + (int64_t) (t0 + t) * kv_row + 128));
         }
-        if (prestage) {
-            stage(t0);
+    };
+    const int nsteps = chunk_live ? min(steps, (n_kv - t0 + FRT_FA_STEP - 1) / FRT_FA_STEP) : 0;
+    const int npre = prestage ? min(NS, nsteps) : 0;   // tiles staged before the dependency wait
+    if (chunk_live) {
+        if (PF) {   // NS == 1: the whole (short) chunk; NS > 1: the pfd tiles after the staged ones
+            l2_rows(npre * FRT_FA_STEP, NS == 1 ? CH : (max(npre, NS) + pfd) * FRT_FA_STEP);
+        }
+        for (int k = 0; k < npre; ++k) {
+            stage(t0 + k * FRT_FA_STEP, k);
         }
     }
     ggml_cuda_pdl_sync();
@@ -2044,25 +2058,29 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
     for (int j = 0; j < D / 8; ++j) {
         o[j][0] = o[j][1] = 0.0f;
     }
-    for (int it = 0; it < steps; ++it) {
+    int issued = npre;
+    for (; issued < min(NS, nsteps); ++issued) {
+        stage(t0 + issued * FRT_FA_STEP, issued);
+    }
+    for (int it = 0; it < nsteps; ++it) {
         const int tb = t0 + it * FRT_FA_STEP;
-        if (tb >= n_kv) {
-            break;
+        const int buf = NS == 1 ? 0 : it % NS;
+        if (NS > 1 && issued - it > 1) {
+            asm volatile("cp.async.wait_group 1;" ::: "memory");   // tile it landed, tile it + 1 in flight
+        } else {
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
         }
-        if (!prestage || it > 0) {
-            __syncthreads();   // previous step's smem reads done
-            stage(tb);
-        }
-        asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
+        const frt_tile_t & sK = sKb[buf];
+        const frt_tile_t & sV = sVb[buf];
         if constexpr (QKN != 0) {   // the new row: use this CTA's own values
             const bool pk = ck >= tb && ck < tb + FRT_FA_STEP, pv = cv >= tb && cv < tb + FRT_FA_STEP;
             if (pk || pv) {
                 if (pk && threadIdx.x < D / 8) {
-                    *(uint4 *) &sK[ck - tb][threadIdx.x * 8] = *(const uint4 *) &sNK[threadIdx.x * 8];
+                    *(uint4 *) &sKb[buf][ck - tb][threadIdx.x * 8] = *(const uint4 *) &sNK[threadIdx.x * 8];
                 }
                 if (pv && threadIdx.x >= 32 && threadIdx.x < 32 + D / 8) {
-                    *(uint4 *) &sV[cv - tb][(threadIdx.x - 32) * 8] = *(const uint4 *) &sNV[(threadIdx.x - 32) * 8];
+                    *(uint4 *) &sVb[buf][cv - tb][(threadIdx.x - 32) * 8] = *(const uint4 *) &sNV[(threadIdx.x - 32) * 8];
                 }
                 __syncthreads();
             }
@@ -2142,6 +2160,14 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
             o[2 * j2][0] = c0[0] + c0[2]; o[2 * j2][1] = c0[1] + c0[3];
             o[2 * j2 + 1][0] = c1[0] + c1[2]; o[2 * j2 + 1][1] = c1[1] + c1[3];
         }
+        if (issued < nsteps) {   // refill the buffer just consumed
+            __syncthreads();
+            stage(t0 + issued * FRT_FA_STEP, NS == 1 ? 0 : issued % NS);
+            if (PF && NS > 1) {
+                l2_rows((issued + pfd) * FRT_FA_STEP, (issued + pfd + 1) * FRT_FA_STEP);
+            }
+            ++issued;
+        }
     }
     // merge the 4 warps' (m, l, O) for each query head
     if (lane % 4 == 0) {
@@ -2149,7 +2175,8 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
         sm_l[warp][lane / 4] = l_run;
     }
     __syncthreads();
-    float * so = (float *) &sK[0][0];   // reuse: [NW][G][D] f32 = 16 KB
+    __syncthreads();
+    float * so = (float *) &sKb[0][0][0];   // reuse: [NW][G][D] f32 = 16 KB
     const int h = lane / 4;
     float M = -INFINITY;
 #pragma unroll
@@ -2253,7 +2280,7 @@ static bool frt_attndec_on() {
 struct frt_fa_plan {
     const ggml_tensor * Q, * K, * V, * mask, * sinks;
     float scale;
-    int n_kv, steps, n_split;
+    int n_kv, steps, n_split, ns;
 };
 
 static bool frt_attndec_plan(const ggml_cgraph * cgraph, const int i, frt_fa_plan & pl) {
@@ -2289,10 +2316,18 @@ static bool frt_attndec_plan(const ggml_cgraph * cgraph, const int i, frt_fa_pla
     static const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     static const int target_ctas = getenv("FRT_ATTNDEC_CTAS") ? atoi(getenv("FRT_ATTNDEC_CTAS")) : 2 * nsm;
     const int tiles = n_kv / FRT_FA_STEP;
-    const int max_split = std::max(1, std::min(FRT_FA_MAX_SPLITS, target_ctas / (int) K->ne[2]));
+    // beyond ~80K cached rows ggml's tensor-core kernel streams the cache slightly faster
+    // (measured 100K: 130.8 vs 134 us per full layer; 64K still favours this kernel)
+    static const int max_tiles = getenv("FRT_ATTNDEC_MAX_TILES") ? atoi(getenv("FRT_ATTNDEC_MAX_TILES")) : 1280;
+    if (max_tiles > 0 && tiles > max_tiles) return false;
+    // long caches: double-buffered tiles, one CTA per SM (two tile buffers per CTA)
+    static const int long_tiles = getenv("FRT_ATTNDEC_LONG_TILES") ? atoi(getenv("FRT_ATTNDEC_LONG_TILES")) : 256;
+    static const int long_ctas  = getenv("FRT_ATTNDEC_LONG_CTAS") ? atoi(getenv("FRT_ATTNDEC_LONG_CTAS")) : nsm;
+    const bool lng = long_tiles > 0 && tiles >= long_tiles;
+    const int max_split = std::max(1, std::min(FRT_FA_MAX_SPLITS, (lng ? long_ctas : target_ctas) / (int) K->ne[2]));
     const int steps = (tiles + max_split - 1) / max_split;
     const int n_split = (tiles + steps - 1) / steps;
-    pl = { Q, K, V, mask, sinks, scale, n_kv, steps, n_split };
+    pl = { Q, K, V, mask, sinks, scale, n_kv, steps, n_split, lng ? 2 : 1 };
     return true;
 }
 
@@ -2316,7 +2351,8 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     const int n_kv = pl.n_kv, steps = pl.steps, n_split = pl.n_split;
     cudaStream_t stream = ctx.stream();
     const dim3 grid((unsigned) n_split, (unsigned) K->ne[2]);
-    const ggml_cuda_kernel_launch_params lp(grid, (dim3) (FRT_FA_NW * WARP_SIZE), 0, stream);
+    const ggml_cuda_kernel_launch_params lp(grid, (dim3) (FRT_FA_NW * WARP_SIZE), (size_t) (pl.ns * FRT_FA_TILE_BYTES), stream);
+    static const int pfd = getenv("FRT_ATTNDEC_PFD") ? atoi(getenv("FRT_ATTNDEC_PFD")) : 2;
     // first-step staging before the dependency wait pays off while the grid
     // fits one CTA per SM (measured: slower beyond that)
     static const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
@@ -2324,13 +2360,30 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     auto launch = [&](auto kernel) {
         ggml_cuda_kernel_launch(kernel, lp, (const float *) Q->data, (int64_t) (Q->nb[2] / sizeof(float)),
             (const char *) K->data, (const char *) V->data, (int64_t) K->nb[1], (int64_t) K->nb[2],
-            (const half *) pl.mask->data, pl.scale, n_kv, g_fa_ml, g_fa_o, n_split, (const float *) g_qkv, qp, steps, prestage);
+            (const half *) pl.mask->data, pl.scale, n_kv, g_fa_ml, g_fa_o, n_split, (const float *) g_qkv, qp, steps, prestage, pfd);
     };
     static const bool pf = !(getenv("FRT_ATTNDEC_PF") && getenv("FRT_ATTNDEC_PF")[0] == '0');   // measured: prefetch on is faster
+    auto launch_ns = [&](auto k1, auto k2) {
+        if (pl.ns == 1) {
+            launch(k1);
+        } else {
+            static bool attr_done = false;   // > 48 KiB of dynamic shared memory
+            if (!attr_done) {
+                CUDA_CHECK(cudaFuncSetAttribute(frt_fa_decode<true, 0, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * FRT_FA_TILE_BYTES));
+                CUDA_CHECK(cudaFuncSetAttribute(frt_fa_decode<true, 1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * FRT_FA_TILE_BYTES));
+                CUDA_CHECK(cudaFuncSetAttribute(frt_fa_decode<true, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * FRT_FA_TILE_BYTES));
+                CUDA_CHECK(cudaFuncSetAttribute(frt_fa_decode<false, 0, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * FRT_FA_TILE_BYTES));
+                CUDA_CHECK(cudaFuncSetAttribute(frt_fa_decode<false, 1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * FRT_FA_TILE_BYTES));
+                CUDA_CHECK(cudaFuncSetAttribute(frt_fa_decode<false, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * FRT_FA_TILE_BYTES));
+                attr_done = true;
+            }
+            launch(k2);
+        }
+    };
     switch (qkn) {
-        case 0:  pf ? launch(frt_fa_decode<true, 0>) : launch(frt_fa_decode<false, 0>); break;
-        case 1:  pf ? launch(frt_fa_decode<true, 1>) : launch(frt_fa_decode<false, 1>); break;
-        default: pf ? launch(frt_fa_decode<true, 2>) : launch(frt_fa_decode<false, 2>); break;
+        case 0:  pf ? launch_ns(frt_fa_decode<true, 0, 1>, frt_fa_decode<true, 0, 2>) : launch_ns(frt_fa_decode<false, 0, 1>, frt_fa_decode<false, 0, 2>); break;
+        case 1:  pf ? launch_ns(frt_fa_decode<true, 1, 1>, frt_fa_decode<true, 1, 2>) : launch_ns(frt_fa_decode<false, 1, 1>, frt_fa_decode<false, 1, 2>); break;
+        default: pf ? launch_ns(frt_fa_decode<true, 2, 1>, frt_fa_decode<true, 2, 2>) : launch_ns(frt_fa_decode<false, 2, 1>, frt_fa_decode<false, 2, 2>); break;
     }
     // FRT_ATTNDEC_CHECK=k (test aid, eager mode only): every k-th call also runs
     // ggml's kernel on the same inputs and prints the max abs / rel difference
@@ -2354,7 +2407,7 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
         double md = 0, mr = 0, nb = 0;
         for (size_t k = 0; k < a.size(); ++k) { md = std::max(md, (double) fabsf(a[k] - b[k])); nb = std::max(nb, (double) fabsf(b[k])); }
         mr = md / std::max(nb, 1e-20);
-        fprintf(stderr, "frt-attndec-check %s n_kv=%d splits=%d steps=%d qkn=%d max|d|=%.3g max|ref|=%.3g rel=%.3g\n", fa->name, n_kv, n_split, steps, qkn, md, nb, mr);
+        fprintf(stderr, "frt-attndec-check %s n_kv=%d splits=%d steps=%d ns=%d qkn=%d max|d|=%.3g max|ref|=%.3g rel=%.3g\n", fa->name, n_kv, n_split, steps, pl.ns, qkn, md, nb, mr);
         CUDA_CHECK(cudaFree(chk));
     }
     *skip_count = 2;
