@@ -461,6 +461,117 @@ struct frt_rope_params {
 
 static constexpr int FRT_QKV_ROWS_MAX = 4096 + 2 * 512;
 
+struct frt_qkn_params {
+    const float * qn_w; const float * kn_w; float eps;
+    float * q_out; half * k_cache; half * v_cache; const int64_t * k_idx; const int64_t * v_idx;
+    size_t k_row_bytes, v_row_bytes;
+    int hq, hk;
+    const int32_t * pos;
+    frt_rope_params rp;
+    int ncols;
+};
+
+// One head of the attention-front epilogue (K_qkn), one warp. Q heads [0,hq), K heads
+// [hq,hq+hk), V heads after. rope=false: stock rms_norm_f32<32,1,vec,mul>
+// (one warp per 128-wide row); rope=true: stock rms_norm_mul_rope_f32<256>
+// (8 warps, 4 of them loaded), NEOX pairs (i, i + n_dims/2), f32 out; K and V
+// rows go to the cache as f16 (set_rows).
+template <bool rope>
+static __device__ __forceinline__ void frt_qkn_head(const float * qkv, const int h, const int lane, const frt_qkn_params & p) {
+    constexpr int D = 128;
+    const bool is_v = h >= p.hq + p.hk;
+    const bool is_k = !is_v && h >= p.hq;
+    const float * xc = qkv + (size_t) h * D;   // written by other CTAs of this or the previous kernel
+    if (is_v) {   // set_rows f32 -> f16 of the scaled V head
+        half * dst = (half *) ((char *) p.v_cache + (size_t) p.v_idx[0] * p.v_row_bytes) + (size_t) (h - p.hq - p.hk) * D;
+#pragma unroll
+        for (int k = 0; k < D / WARP_SIZE; ++k) {
+            dst[lane + k * WARP_SIZE] = __float2half(__ldcg(xc + lane + k * WARP_SIZE));
+        }
+        return;
+    }
+    const float * mulc = is_k ? p.kn_w : p.qn_w;
+    float out[4];
+    int   oix[4];
+    if constexpr (!rope) {
+        const float4 * x4 = (const float4 *) xc;
+        float4 xs[1];
+        float tmp = 0.0f;
+        xs[0] = __ldcg(x4 + lane);
+        tmp += xs[0].x*xs[0].x + xs[0].y*xs[0].y + xs[0].z*xs[0].z + xs[0].w*xs[0].w;
+        tmp = warp_reduce_sum(tmp);
+        const float scale = rsqrtf(tmp / p.ncols + p.eps);
+        float4 r = make_float4(scale*xs[0].x, scale*xs[0].y, scale*xs[0].z, scale*xs[0].w);
+        const float4 m = ((const float4 *) mulc)[lane];
+        r.x *= m.x;
+        r.y *= m.y;
+        r.z *= m.z;
+        r.w *= m.w;
+        out[0] = r.x; out[1] = r.y; out[2] = r.z; out[3] = r.w;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) oix[k] = 4 * lane + k;
+    } else {
+        // 256 virtual threads: v < 128 holds element v, virtual warps 4..7 hold
+        // 0; block_reduce then sums the 8 warp partials (+ zero sentinels).
+        float s4[4];
+#pragma unroll
+        for (int wv = 0; wv < 4; ++wv) {
+            const float xi = __ldcg(xc + wv * WARP_SIZE + lane);
+            float tmp = 0.0f;
+            tmp += xi * xi;
+            s4[wv] = warp_reduce_sum(tmp);
+        }
+        float tot = 0.0f;
+        if (lane == 0) tot = s4[0];
+        else if (lane == 1) tot = s4[1];
+        else if (lane == 2) tot = s4[2];
+        else if (lane == 3) tot = s4[3];
+        tot = warp_reduce_sum(tot);
+        const float scale = rsqrtf(tot/p.ncols + p.eps);
+        // pairs i0 = 2*v for virtual v < 64: lane covers v = lane and v = lane + 32
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int v  = lane + k * WARP_SIZE;
+            const int i0 = 2 * v;
+            const int ix0 = i0 / 2;
+            const int ix1 = i0 / 2 + p.rp.n_dims / 2;
+            const float x0 = scale * __ldcg(xc + ix0) * mulc[ix0];
+            const float x1 = scale * __ldcg(xc + ix1) * mulc[ix1];
+            const float theta_base  = p.pos[0]*powf(p.rp.theta_scale, i0/2.0f);
+            const float freq_factor = 1.0f;
+            float cos_theta;
+            float sin_theta;
+            {   // rope_yarn<true>
+                const float theta_extrap = theta_base/freq_factor;
+                float mscale = p.rp.attn_factor;
+                float theta_interp = p.rp.freq_scale * theta_extrap;
+                float theta = theta_interp;
+                if (p.rp.ext_factor != 0.0f) {
+                    const float y = (i0 / 2 - p.rp.corr0) / max(0.001f, p.rp.corr1 - p.rp.corr0);
+                    const float ramp_mix = (1.0f - min(1.0f, max(0.0f, y))) * p.rp.ext_factor;
+                    theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+                    mscale *= 1.0f + 0.1f * logf(1.0f / p.rp.freq_scale);
+                }
+                cos_theta = cosf(theta) * mscale;
+                sin_theta = sinf(theta) * mscale;
+            }
+            out[2 * k]     = x0*cos_theta - x1*sin_theta;
+            out[2 * k + 1] = x0*sin_theta + x1*cos_theta;
+            oix[2 * k]     = ix0;
+            oix[2 * k + 1] = ix1;
+        }
+    }
+    if (is_k) {
+        half * dst = (half *) ((char *) p.k_cache + (size_t) p.k_idx[0] * p.k_row_bytes) + (size_t) (h - p.hq) * D;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) dst[oix[k]] = __float2half(out[k]);
+    } else {
+        float * dst = p.q_out + (size_t) h * D;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) dst[oix[k]] = out[k];
+    }
+}
+
 // K_qkv: one warp per output row; rows [0,nq) Q, [nq,nq+nk) K, then V.
 template <int NW>
 static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_attn_qkv(
@@ -508,110 +619,15 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_attn_qkv(
 // rope=true:  stock rms_norm_mul_rope_f32<256> (8 warps, 4 of them loaded),
 // NEOX pairs (i, i + n_dims/2), f32 out; K and V rows go to the cache as f16.
 template <bool rope>
-static __global__ void frt_attn_qkn(
-        const float * qkv, const float * qn_w, const float * kn_w, const float eps,
-        float * q_out, half * k_cache, half * v_cache, const int64_t * k_idx, const int64_t * v_idx,
-        const size_t k_row_bytes, const size_t v_row_bytes,
-        const int hq, const int hk, const int32_t * pos, const frt_rope_params rp, const int ncols) {
+static __global__ void frt_attn_qkn(const float * qkv, const frt_qkn_params p) {
     ggml_cuda_pdl_lc();
-    constexpr int D = 128;
     const int h = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
-    if (h >= hq + 2 * hk) {
+    if (h >= p.hq + 2 * p.hk) {
         return;
     }
     ggml_cuda_pdl_sync();
-    const bool is_v = h >= hq + hk;
-    const bool is_k = !is_v && h >= hq;
-    const float * xc = qkv + (size_t) h * D;
-    if (is_v) {   // set_rows f32 -> f16 of the scaled V head
-        half * dst = (half *) ((char *) v_cache + (size_t) v_idx[0] * v_row_bytes) + (size_t) (h - hq - hk) * D;
-#pragma unroll
-        for (int k = 0; k < D / WARP_SIZE; ++k) {
-            dst[lane + k * WARP_SIZE] = __float2half(xc[lane + k * WARP_SIZE]);
-        }
-        return;
-    }
-    const float * mulc = is_k ? kn_w : qn_w;
-    float out[4];
-    int   oix[4];
-    if constexpr (!rope) {
-        const float4 * x4 = (const float4 *) xc;
-        float4 xs[1];
-        float tmp = 0.0f;
-        xs[0] = x4[lane];
-        tmp += xs[0].x*xs[0].x + xs[0].y*xs[0].y + xs[0].z*xs[0].z + xs[0].w*xs[0].w;
-        tmp = warp_reduce_sum(tmp);
-        const float scale = rsqrtf(tmp / ncols + eps);
-        float4 r = make_float4(scale*xs[0].x, scale*xs[0].y, scale*xs[0].z, scale*xs[0].w);
-        const float4 m = ((const float4 *) mulc)[lane];
-        r.x *= m.x;
-        r.y *= m.y;
-        r.z *= m.z;
-        r.w *= m.w;
-        out[0] = r.x; out[1] = r.y; out[2] = r.z; out[3] = r.w;
-#pragma unroll
-        for (int k = 0; k < 4; ++k) oix[k] = 4 * lane + k;
-    } else {
-        // 256 virtual threads: v < 128 holds element v, virtual warps 4..7 hold
-        // 0; block_reduce then sums the 8 warp partials (+ zero sentinels).
-        float s4[4];
-#pragma unroll
-        for (int wv = 0; wv < 4; ++wv) {
-            const float xi = xc[wv * WARP_SIZE + lane];
-            float tmp = 0.0f;
-            tmp += xi * xi;
-            s4[wv] = warp_reduce_sum(tmp);
-        }
-        float tot = 0.0f;
-        if (lane == 0) tot = s4[0];
-        else if (lane == 1) tot = s4[1];
-        else if (lane == 2) tot = s4[2];
-        else if (lane == 3) tot = s4[3];
-        tot = warp_reduce_sum(tot);
-        const float scale = rsqrtf(tot/ncols + eps);
-        // pairs i0 = 2*v for virtual v < 64: lane covers v = lane and v = lane + 32
-#pragma unroll
-        for (int k = 0; k < 2; ++k) {
-            const int v  = lane + k * WARP_SIZE;
-            const int i0 = 2 * v;
-            const int ix0 = i0 / 2;
-            const int ix1 = i0 / 2 + rp.n_dims / 2;
-            const float x0 = scale * xc[ix0] * mulc[ix0];
-            const float x1 = scale * xc[ix1] * mulc[ix1];
-            const float theta_base  = pos[0]*powf(rp.theta_scale, i0/2.0f);
-            const float freq_factor = 1.0f;
-            float cos_theta;
-            float sin_theta;
-            {   // rope_yarn<true>
-                const float theta_extrap = theta_base/freq_factor;
-                float mscale = rp.attn_factor;
-                float theta_interp = rp.freq_scale * theta_extrap;
-                float theta = theta_interp;
-                if (rp.ext_factor != 0.0f) {
-                    const float y = (i0 / 2 - rp.corr0) / max(0.001f, rp.corr1 - rp.corr0);
-                    const float ramp_mix = (1.0f - min(1.0f, max(0.0f, y))) * rp.ext_factor;
-                    theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
-                    mscale *= 1.0f + 0.1f * logf(1.0f / rp.freq_scale);
-                }
-                cos_theta = cosf(theta) * mscale;
-                sin_theta = sinf(theta) * mscale;
-            }
-            out[2 * k]     = x0*cos_theta - x1*sin_theta;
-            out[2 * k + 1] = x0*sin_theta + x1*cos_theta;
-            oix[2 * k]     = ix0;
-            oix[2 * k + 1] = ix1;
-        }
-    }
-    if (is_k) {
-        half * dst = (half *) ((char *) k_cache + (size_t) k_idx[0] * k_row_bytes) + (size_t) (h - hq) * D;
-#pragma unroll
-        for (int k = 0; k < 4; ++k) dst[oix[k]] = __float2half(out[k]);
-    } else {
-        float * dst = q_out + (size_t) h * D;
-#pragma unroll
-        for (int k = 0; k < 4; ++k) dst[oix[k]] = out[k];
-    }
+    frt_qkn_head<rope>(qkv, h, lane, p);
 }
 
 static float * g_qkv = nullptr;
@@ -742,27 +758,20 @@ static bool frt_attnqkv_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     cudaStream_t stream = ctx.stream();
     constexpr int NW = 8;
     const int nrows = nq + 2 * nk;
-    ggml_cuda_kernel_launch(frt_attn_qkv<NW>, ggml_cuda_kernel_launch_params((dim3) ((nrows + NW - 1) / NW), (dim3) (NW * WARP_SIZE), 0, stream),
+    const int hq = nq / 128, hk = nk / 128, nh = hq + 2 * hk;
+    const frt_qkn_params qp = { (const float *) qnw->data, (const float *) knw->data, qeps,
+        (float *) qfin->data, (half *) k_set->data, (half *) v_set->data,
+        (const int64_t *) k_set->src[1]->data, (const int64_t *) v_set->src[1]->data,
+        (size_t) k_set->nb[1], (size_t) v_set->nb[1], hq, hk, pos, rp, 128 };
+    const ggml_cuda_kernel_launch_params lp1((dim3) ((nrows + NW - 1) / NW), (dim3) (NW * WARP_SIZE), 0, stream);
+    ggml_cuda_kernel_launch(frt_attn_qkv<NW>, lp1,
         (const float *) x->data, (const float *) nw->data, eps,
         (const char *) wq->data, (const char *) wk->data, (const char *) wv->data, (size_t) wq->nb[1],
         (const float *) sq->data, (const float *) sk->data, (const float *) sv->data,
         g_qkv, nq, nk, 0.0f, FRT_K_EMBD);
-    const int hq = nq / 128, hk = nk / 128, nh = hq + 2 * hk;
     constexpr int HW = 4;   // heads (warps) per CTA
     const ggml_cuda_kernel_launch_params lp2((dim3) ((nh + HW - 1) / HW), (dim3) (HW * WARP_SIZE), 0, stream);
-    if (rope) {
-        ggml_cuda_kernel_launch(frt_attn_qkn<true>, lp2,
-            (const float *) g_qkv, (const float *) qnw->data, (const float *) knw->data, qeps,
-            (float *) qfin->data, (half *) k_set->data, (half *) v_set->data,
-            (const int64_t *) k_set->src[1]->data, (const int64_t *) v_set->src[1]->data,
-            (size_t) k_set->nb[1], (size_t) v_set->nb[1], hq, hk, pos, rp, 128);
-    } else {
-        ggml_cuda_kernel_launch(frt_attn_qkn<false>, lp2,
-            (const float *) g_qkv, (const float *) qnw->data, (const float *) knw->data, qeps,
-            (float *) qfin->data, (half *) k_set->data, (half *) v_set->data,
-            (const int64_t *) k_set->src[1]->data, (const int64_t *) v_set->src[1]->data,
-            (size_t) k_set->nb[1], (size_t) v_set->nb[1], hq, hk, (const int32_t *) nullptr, rp, 128);
-    }
+    ggml_cuda_kernel_launch(rope ? frt_attn_qkn<true> : frt_attn_qkn<false>, lp2, (const float *) g_qkv, qp);
     if (frt_stats_on()) {
         static long fires = 0;
         if ((++fires & 0xFFF) == 1) fprintf(stderr, "frt-stats attnqkv fires=%ld span=%d rope=%d\n", fires, end - i + 1, (int) rope);
@@ -840,11 +849,11 @@ static bool frt_oproj_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
 // mul_mat_vec_f<bf16, 256>, each recomputing the (exact) RMSNorm; the last CTA
 // to finish runs the topk_moe selection on the staged logits. CTA 0 also
 // writes the normalized activation that the expert GEMVs consume.
+// Per-layer MoE state shared by the expert kernels (private buffers, never
+// aliased by the graph allocator).
 struct frt_moe_tail {
     block_q8_1 * glu_q8;     // n_used * n_ff/32 routed blocks, then n_ff_sh/32 shared
-    float      * esc;        // e per routed slot
-    int        * amax;       // per slot, f32 bits (values >= 0 or -FLT_MAX), reset by the last CTA
-    unsigned   * cnt;        // per slot + 1 shared, reset by the last CTA
+    float      * esc;        // activation rescale e per routed slot
     int32_t    * ids;        // snapshot of the routing ids / weights: the layer output written
     float      * wts;        // by K2 may be allocated over the (dead after K2) graph tensors
 };
@@ -1065,11 +1074,7 @@ static bool frt_route_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
 struct frt_moe_chain { float s1, b1, s2, b2, cmin, cmax, s3, b3; };
 
 // K1: one warp per GLU output; outputs [0, n_used*n_ff) routed, then n_ff_sh
-// shared; each CTA's NW outputs lie in one routed slot or in the shared expert.
-// Tail: per routed slot, CTAs fold max|glu| into amax[slot]; the last CTA of
-// the slot derives the rescale e (stock expression chain) and writes the q8_1
-// chunks of glu / e; the last shared CTA writes the shared q8_1 chunks. Every
-// down-projection CTA then reads these blocks instead of rebuilding them.
+// shared. CTA 0 snapshots the routing ids / weights for K2.
 
 template <int NW, bool ACT_Q8>
 static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_gu(
@@ -1077,12 +1082,10 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_gu(
         const char * gate_w, const char * up_w, const size_t e_stride, const size_t row_stride,
         const float * gate_sc, const float * up_sc,
         const char * shg_w, const char * shu_w, const float * shg_sc, const float * shu_sc,
-        float * glu_out, const frt_moe_tail tl, const frt_moe_chain ch,
+        float * glu_out, const frt_moe_tail tl,
         const int n_used, const int n_ff, const int n_ff_sh, const float fzero) {
     ggml_cuda_pdl_lc();
     __shared__ block_q8_1 yq_sh[ACT_Q8 ? 1 : FRT_K_EMBD / QK8_1];
-    __shared__ float cmax[NW];
-    __shared__ bool last;
     const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
     const int o = blockIdx.x * NW + warp;
     const int n_routed = n_used * n_ff;
@@ -1107,8 +1110,8 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_gu(
         __syncthreads();
         yq = yq_sh;
     }
-    float res = -FLT_MAX;
     if (active) {
+        float res;
         frt_nvb bg[2], bu[2];
         float gs, us;
         if (routed) {
@@ -1147,60 +1150,51 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_gu(
         }
         if (lane == 0) {
             glu_out[o] = res;
-            __threadfence();   // visible to the slot's last CTA
         }
     }
-    // ---- tail: slot-wide max |glu| and last-CTA quantization
-    const int o0 = blockIdx.x * NW;
-    const bool cta_routed = o0 < n_routed;
-    const int slot = cta_routed ? o0 / n_ff : n_used;
-    if (lane == 0) {
-        cmax[warp] = active ? fabsf(res) : -FLT_MAX;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        if (cta_routed) {
-            float m = -FLT_MAX;
-            for (int w = 0; w < NW; ++w) {
-                m = fmaxf(m, cmax[w]);
-            }
-            atomicMax(&tl.amax[slot], __float_as_int(m));
+}
+
+// K1b: one CTA per routed slot (+1 for the shared expert). Routed: thread t holds glu[slot][t] (n_ff = NW * 32), block max ->
+// e (stock chain) -> warp w quantizes chunk w of glu / e. Shared: plain q8_1.
+template <int NW>
+static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_glu_q8(
+        const float * glu, const frt_moe_tail tl, const frt_moe_chain ch,
+        const int n_used, const int n_ff, const int n_ff_sh) {
+    ggml_cuda_pdl_lc();
+    __shared__ float red[NW];
+    __shared__ float e_sh;
+    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const int s = blockIdx.x;
+    ggml_cuda_pdl_sync();
+    if (s < n_used) {
+        const float v = glu[s * n_ff + threadIdx.x];
+        float m = fmaxf(-FLT_MAX, fabsf(v));
+        m = warp_reduce_max(m);
+        if (lane == 0) {
+            red[warp] = m;
         }
-        __threadfence();
-        const unsigned n_cta = cta_routed ? (unsigned) (n_ff / NW) : (unsigned) ((n_ff_sh + NW - 1) / NW);
-        last = atomicAdd(&tl.cnt[slot], 1u) == n_cta - 1;
-    }
-    __syncthreads();
-    if (!last) {
-        return;
-    }
-    __threadfence();
-    if (cta_routed) {
-        const float m = __int_as_float(__ldcg(&tl.amax[slot]));
-        float e = ch.s1 * m + ch.b1;
-        e = logf(e);
-        e = ch.s2 * e + ch.b2;
-        e = ceilf(e);
-        e = fminf(fmaxf(e, ch.cmin), ch.cmax);
-        e = ch.s3 * e + ch.b3;
-        e = expf(e);
-        const int cpe = n_ff / QK8_1;
-        for (int k = warp; k < cpe; k += NW) {
-            const float x = __ldcg(glu_out + slot * n_ff + k * QK8_1 + lane) / e;
-            frt_q8_1_chunk(x, lane, &tl.glu_q8[slot * cpe + k]);
-        }
+        __syncthreads();
         if (threadIdx.x == 0) {
-            tl.esc[slot] = e;
-            tl.amax[slot] = __float_as_int(-FLT_MAX);
-            tl.cnt[slot] = 0;
+            float a = red[0];
+            for (int w = 1; w < NW; ++w) {
+                a = fmaxf(a, red[w]);
+            }
+            float e = ch.s1 * a + ch.b1;
+            e = logf(e);
+            e = ch.s2 * e + ch.b2;
+            e = ceilf(e);
+            e = fminf(fmaxf(e, ch.cmin), ch.cmax);
+            e = ch.s3 * e + ch.b3;
+            e = expf(e);
+            e_sh = e;
+            tl.esc[s] = e;
         }
+        __syncthreads();
+        frt_q8_1_chunk(v / e_sh, lane, &tl.glu_q8[s * (n_ff / QK8_1) + warp]);
     } else {
         const int base = n_used * (n_ff / QK8_1);
         for (int k = warp; k < n_ff_sh / QK8_1; k += NW) {
-            frt_q8_1_chunk(__ldcg(glu_out + n_routed + k * QK8_1 + lane), lane, &tl.glu_q8[base + k]);
-        }
-        if (threadIdx.x == 0) {
-            tl.cnt[slot] = 0;
+            frt_q8_1_chunk(glu[n_used * n_ff + k * QK8_1 + lane], lane, &tl.glu_q8[base + k]);
         }
     }
 }
@@ -1437,7 +1431,10 @@ static void frt_moeffn_launch(ggml_backend_cuda_context & ctx, const frt_moeffn_
         (const char *) m.gw->data, (const char *) m.uw->data, (size_t) m.gw->nb[2], (size_t) m.gw->nb[1],
         (const float *) m.gsc->data, (const float *) m.usc->data,
         (const char *) m.shgw->data, (const char *) m.shuw->data, (const float *) m.shgs->data, (const float *) m.shus->data,
-        g_moe_glu, g_moe_tail, m.ch, m.n_used, m.n_ff, m.n_ff_sh, 0.0f);
+        g_moe_glu, g_moe_tail, m.n_used, m.n_ff, m.n_ff_sh, 0.0f);
+    constexpr int NWQ = 16;   // n_ff = 512 = NWQ * 32 (pinned by the predicate)
+    ggml_cuda_kernel_launch(frt_moe_glu_q8<NWQ>, ggml_cuda_kernel_launch_params((dim3) (m.n_used + 1), (dim3) (NWQ * WARP_SIZE), 0, stream),
+        (const float *) g_moe_glu, g_moe_tail, m.ch, m.n_used, m.n_ff, m.n_ff_sh);
     constexpr int NW2 = 8;
     ggml_cuda_kernel_launch(frt_moe_down<NW2>, ggml_cuda_kernel_launch_params((dim3) ((m.K + NW2 - 1) / NW2), (dim3) (NW2 * WARP_SIZE), 0, stream),
         (const block_q8_1 *) g_moe_tail.glu_q8, (const float *) g_moe_tail.esc, (const int32_t *) g_moe_tail.ids, (const float *) g_moe_tail.wts,
@@ -1489,15 +1486,7 @@ void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
         CUDA_CHECK(cudaMalloc(&g_act_q8, (FRT_K_EMBD / QK8_1) * sizeof(block_q8_1)));
         CUDA_CHECK(cudaMalloc(&g_moe_tail.glu_q8, (FRT_MOE_GLU_CAP / QK8_1) * sizeof(block_q8_1)));
         CUDA_CHECK(cudaMalloc(&g_moe_tail.esc, FRT_MOE_MAX_USED * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&g_moe_tail.amax, FRT_MOE_MAX_USED * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&g_moe_tail.cnt, (FRT_MOE_MAX_USED + 1) * sizeof(unsigned)));
-        CUDA_CHECK(cudaMemset(g_moe_tail.cnt, 0, (FRT_MOE_MAX_USED + 1) * sizeof(unsigned)));
         CUDA_CHECK(cudaMalloc(&g_moe_tail.ids, FRT_MOE_MAX_USED * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&g_moe_tail.wts, FRT_MOE_MAX_USED * sizeof(float)));
-        {
-            int init[FRT_MOE_MAX_USED];
-            for (int k = 0; k < FRT_MOE_MAX_USED; ++k) { const float v = -FLT_MAX; memcpy(&init[k], &v, sizeof(v)); }
-            CUDA_CHECK(cudaMemcpy(g_moe_tail.amax, init, sizeof(init), cudaMemcpyHostToDevice));
-        }
     }
 }
