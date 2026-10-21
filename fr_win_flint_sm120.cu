@@ -15,8 +15,10 @@
 #include "vecdotq.cuh"
 #include "unary.cuh"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <cstdlib>
 #include <cstring>
 
@@ -219,10 +221,10 @@ static const ggml_tensor * frt_mm_scale_src(const ggml_tensor * mul, const ggml_
 }
 
 // every node of [a, b) except `keep` must be consumed only inside [a, b]
-static bool frt_span_closed(const ggml_cgraph * cgraph, int a, int b, const ggml_tensor * keep0, const ggml_tensor * keep1) {
+static bool frt_span_closed(const ggml_cgraph * cgraph, int a, int b, std::initializer_list<const ggml_tensor *> keep) {
     for (int j = a; j < b; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
-        if (n == keep0 || n == keep1) continue;
+        if (std::find(keep.begin(), keep.end(), n) != keep.end()) continue;
         if (n->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
         int refs = 0;
         for (int k = a; k <= b; ++k) {
@@ -306,6 +308,21 @@ static __device__ __forceinline__ float frt_vd(const frt_nvb & b, const block_q8
 }
 
 static __device__ __forceinline__ int frt_lane_iqs(const int lane) { return 4 * (lane % 2); }
+
+// q8_1 of NCH chunks of `src` per warp (chunks c0, c0 + cstride, ...): all
+// loads are issued first, then the chunks are quantized from registers.
+template <int NCH>
+static __device__ __forceinline__ void frt_q8_1_chunks(const float * src, block_q8_1 * dst, const int c0, const int cstride, const int lane) {
+    float v[NCH];
+#pragma unroll
+    for (int k = 0; k < NCH; ++k) {
+        v[k] = src[(c0 + k * cstride) * QK8_1 + lane];
+    }
+#pragma unroll
+    for (int k = 0; k < NCH; ++k) {
+        frt_q8_1_chunk(v[k], lane, &dst[c0 + k * cstride]);
+    }
+}
 
 // mmvq row dot, NVFP4, K = 2048 (32 blocks): ggml launches 4 warps of which
 // warps 0/1 cover blocks [0,16) / [16,32) (one block per lane pair), then sums
@@ -711,7 +728,7 @@ static bool frt_attnqkv_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     };
     if (!set_ok(k_set, kfin) || !set_ok(v_set, vmul)) return false;
     // everything inside the span except Q's final tensor and the two cache writes is internal
-    if (!frt_span_closed(cgraph, i, end, qfin, k_set)) return false;
+    if (!frt_span_closed(cgraph, i, end, { qfin, k_set })) return false;
 
     cudaStream_t stream = ctx.stream();
     constexpr int NW = 8;
@@ -764,9 +781,8 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_oproj(
         sc = s[0];
     }
     ggml_cuda_pdl_sync();
-    for (int c = warp; c < 4096 / QK8_1; c += NW) {
-        frt_q8_1_chunk(a[c * QK8_1 + lane], lane, &yq[c]);
-    }
+    static_assert((4096 / QK8_1) % NW == 0, "chunks per warp");
+    frt_q8_1_chunks<4096 / QK8_1 / NW>(a, yq, warp, NW, lane);
     __syncthreads();
     if (!active) {
         return;
@@ -807,6 +823,188 @@ static bool frt_oproj_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
     return true;
 }
 
+// ---- MoE routing (FRT window ROUTE) -----------------------------------------
+// ffn RMSNorm -> router GEMV (BF16) -> sigmoid top-k with weight
+// normalization: 3 stock launches -> 1. One CTA per router row as in
+// mul_mat_vec_f<bf16, 256>, each recomputing the (exact) RMSNorm; the last CTA
+// to finish runs the topk_moe selection on the staged logits. CTA 0 also
+// writes the normalized activation that the expert GEMVs consume.
+static float * g_route_logits = nullptr;
+static unsigned int * g_route_count = nullptr;
+
+template <int NW>
+static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_route(
+        const float * x, const float * norm_w, const float eps, const int ncols, float * xn_out,
+        const nv_bfloat16 * wr, const int64_t wr_stride, float * logits, unsigned int * count,
+        int32_t * ids_out, float * w_out, const int n_expert_used, const float clamp_val, const float scale_val) {
+    static_assert(NW * WARP_SIZE == 256, "mul_mat_vec_f block size");
+    constexpr int n_experts = 256;
+    ggml_cuda_pdl_lc();
+    __shared__ float xn[FRT_K_EMBD];
+    __shared__ float red[32];
+    __shared__ float buf_iw[WARP_SIZE];
+    __shared__ bool last;
+    const int tid = threadIdx.x, warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
+    const int row = blockIdx.x;
+    // router row (immutable): fetch before the dependency wait
+    const nv_bfloat162 * x2 = (const nv_bfloat162 *) (wr + (int64_t) row * wr_stride);
+    nv_bfloat162 wv[FRT_K_EMBD / 2 / 256];
+#pragma unroll
+    for (int k = 0; k < FRT_K_EMBD / 2 / 256; ++k) {
+        wv[k] = x2[tid + 256 * k];
+    }
+    if (tid < WARP_SIZE) {
+        buf_iw[tid] = 0.0f;
+    }
+    ggml_cuda_pdl_sync();
+    frt_rms_norm_2048<NW>(x, norm_w, eps, xn, red, ncols);
+    __syncthreads();
+    if (row == 0) {
+        for (int c = tid; c < FRT_K_EMBD / 4; c += 256) {
+            ((float4 *) xn_out)[c] = ((const float4 *) xn)[c];
+        }
+    }
+    // mul_mat_vec_f<nv_bfloat16, float, 1, 256>
+    const float2 * y2 = (const float2 *) xn;
+    float sumf = 0.0f;
+#pragma unroll
+    for (int k = 0; k < FRT_K_EMBD / 2 / 256; ++k) {
+        const int col2 = tid + 256 * k;
+        const nv_bfloat162 tmpx = wv[k];
+        const float2 tmpy = y2[col2];
+        ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+        ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+    }
+    sumf = warp_reduce_sum<WARP_SIZE>(sumf);
+    buf_iw[tid / WARP_SIZE] = sumf;
+    __syncthreads();
+    if (tid < WARP_SIZE) {
+        sumf = buf_iw[tid];
+        sumf = warp_reduce_sum<WARP_SIZE>(sumf);
+    }
+    if (tid == 0) {
+        logits[row] = sumf;
+        __threadfence();
+        last = atomicAdd(count, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last || warp != 0) {
+        return;
+    }
+    __threadfence();
+    // topk_moe_cuda<256, false>: sigmoid, top-k, normalized weights
+    constexpr int experts_per_thread = n_experts / WARP_SIZE;
+    float wt[experts_per_thread];
+#pragma unroll
+    for (int i = 0; i < n_experts; i += WARP_SIZE) {
+        wt[i / WARP_SIZE] = __ldcg(logits + i + lane);
+    }
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        wt[i] = 1.f / (1.f + expf(-wt[i]));
+    }
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        if (__isnanf(wt[i])) {
+            wt[i] = -FLT_MAX;
+        }
+    }
+    float wt_sum = 0.f;
+    float output_weights[experts_per_thread];
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        output_weights[i] = 0.f;
+    }
+    for (int k = 0; k < n_expert_used; k++) {
+        float max_val    = wt[0];
+        int   max_expert = lane;
+#pragma unroll
+        for (int i = 1; i < experts_per_thread; i++) {
+            const int expert = lane + i * WARP_SIZE;
+            if (wt[i] > max_val) {
+                max_val    = wt[i];
+                max_expert = expert;
+            }
+        }
+#pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+            const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+            const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+            if (val > max_val || (val == max_val && expert < max_expert)) {
+                max_val    = val;
+                max_expert = expert;
+            }
+        }
+        if ((max_expert & (WARP_SIZE - 1)) == lane) {
+            wt[max_expert / WARP_SIZE] = -INFINITY;
+        }
+        if ((k & (WARP_SIZE - 1)) == lane) {
+            output_weights[k / WARP_SIZE] = max_val;
+        }
+        if ((max_expert & (WARP_SIZE - 1)) == lane) {
+            ids_out[k] = max_expert;
+            wt_sum += max_val;
+        }
+    }
+    wt_sum              = warp_reduce_sum(wt_sum);
+    wt_sum              = max(wt_sum, clamp_val);
+    const float inv_sum = 1.0f / wt_sum;
+    for (int i = 0; i < experts_per_thread; i++) {
+        output_weights[i] *= inv_sum;
+    }
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const int idx = i * WARP_SIZE + lane;
+        if (idx < n_expert_used) {
+            w_out[idx] = output_weights[i] * scale_val;
+        }
+    }
+    if (lane == 0) {
+        *count = 0;   // ready for the next layer
+    }
+}
+
+// anchor: RMS_NORM + MUL(ffn_norm.weight) followed by the router span.
+static bool frt_route_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
+    static const bool on = frt_window_on("GGML_FLASHRT_NO_ROUTE");
+    if (!on || g_route_logits == nullptr || i + 11 >= cgraph->n_nodes) return false;
+    ggml_tensor * const * nd = cgraph->nodes + i;
+    const ggml_tensor * rn = nd[0];
+    ggml_tensor * fn = nd[1];
+    if (rn->op != GGML_OP_RMS_NORM || fn->op != GGML_OP_MUL || fn->src[0] != rn || !strstr(fn->src[1]->name, ".ffn_norm.weight")) return false;
+    const ggml_tensor * mm = nd[2];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != fn || !strstr(mm->src[0]->name, ".ffn_gate_inp.weight")) return false;
+    const ggml_tensor * x = rn->src[0], * nw = fn->src[1], * wr = mm->src[0];
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || ggml_nrows(x) != 1 || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
+    if (nw->type != GGML_TYPE_F32 || ggml_nelements(nw) != FRT_K_EMBD || !frt_aligned16(nw->data)) return false;
+    if (fn->type != GGML_TYPE_F32 || !ggml_is_contiguous(fn) || !frt_aligned16(fn->data)) return false;
+    if (wr->type != GGML_TYPE_BF16 || wr->ne[0] != FRT_K_EMBD || wr->ne[1] != 256 || !ggml_is_contiguous(wr)) return false;
+    // sigmoid -> reshape -> argsort(desc) -> view top-k -> get_rows -> reshape -> sum_rows -> clamp -> div
+    const ggml_tensor * sg = nd[3], * prs = nd[4], * as = nd[5], * tk = nd[6], * gr = nd[7], * wrs = nd[8], * sr = nd[9], * cl = nd[10];
+    ggml_tensor * dv = nd[11];
+    if (!frt_unary_is(sg, GGML_UNARY_OP_SIGMOID) || sg->src[0] != mm) return false;
+    if (prs->op != GGML_OP_RESHAPE || prs->src[0] != sg) return false;
+    if (as->op != GGML_OP_ARGSORT || as->src[0] != sg || ggml_get_op_params_i32(as, 0) != GGML_SORT_ORDER_DESC || as->type != GGML_TYPE_I32) return false;
+    if (tk->op != GGML_OP_VIEW || tk->src[0] != as || tk->view_offs != 0) return false;
+    const int n_used = (int) tk->ne[0];
+    if (gr->op != GGML_OP_GET_ROWS || gr->src[0] != prs || gr->src[1] != tk) return false;
+    if (wrs->op != GGML_OP_RESHAPE || wrs->src[0] != gr) return false;
+    if (sr->op != GGML_OP_SUM_ROWS || sr->src[0] != wrs) return false;
+    if (cl->op != GGML_OP_CLAMP || cl->src[0] != sr) return false;
+    if (dv->op != GGML_OP_DIV || dv->src[0] != wrs || dv->src[1] != cl || dv->type != GGML_TYPE_F32 || !ggml_is_contiguous(dv)) return false;
+    if (n_used < 1 || n_used > 32 || tk->ne[1] != 1 || ggml_nrows(as) != 1 || as->ne[0] != 256) return false;
+    if (!frt_span_closed(cgraph, i, i + 11, { fn, as, tk })) return false;
+    float eps; memcpy(&eps, rn->op_params, sizeof(float));
+    const float clamp_val = ggml_get_op_params_f32(cl, 0);
+    constexpr int NW = 8;
+    ggml_cuda_kernel_launch(frt_route<NW>, ggml_cuda_kernel_launch_params((dim3) 256, (dim3) (NW * WARP_SIZE), 0, ctx.stream()),
+        (const float *) x->data, (const float *) nw->data, eps, FRT_K_EMBD, (float *) fn->data,
+        (const nv_bfloat16 *) wr->data, (int64_t) (wr->nb[1] / sizeof(nv_bfloat16)), g_route_logits, g_route_count,
+        (int32_t *) as->data, (float *) dv->data, n_used, clamp_val, 1.0f);
+    *skip_count = 12;
+    return true;
+}
+
 // ---- MoE FFN span (FRT window MOEFFN) --------------------------------------
 // Replaces, for one decode token, everything after the router/top-k up to the
 // layer output: routed gate/up MUL_MAT_ID + scales + SwiGLU, the activation
@@ -837,9 +1035,8 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_gu(
         frt_l2_prefetch(shu_w + (size_t) r * row_stride, row_stride, lane);
     }
     ggml_cuda_pdl_sync();
-    for (int c = warp; c < FRT_K_EMBD / QK8_1; c += NW) {
-        frt_q8_1_chunk(act[c * QK8_1 + lane], lane, &yq[c]);
-    }
+    static_assert((FRT_K_EMBD / QK8_1) % NW == 0, "chunks per warp");
+    frt_q8_1_chunks<FRT_K_EMBD / QK8_1 / NW>(act, yq, warp, NW, lane);
     __syncthreads();
     if (!active) {
         return;
@@ -908,35 +1105,41 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_moe_down(
         frt_l2_prefetch(shd_w + (size_t) row * shd_row_stride, shd_row_stride, lane);
     }
     ggml_cuda_pdl_sync();
-    for (int s = warp; s < n_used; s += NW) {
+    constexpr int CPE = 512 / QK8_1;   // chunks per routed row (n_ff = 512, pinned)
+    const int cpe = CPE;
+    if (warp < n_used) {               // warp s: amax -> e -> its 16 chunks, all from registers
+        const int s = warp;
+        float v[CPE];
+#pragma unroll
+        for (int k = 0; k < CPE; ++k) {
+            v[k] = glu[s * n_ff + k * QK8_1 + lane];
+        }
         float m = -FLT_MAX;
-        for (int j = lane; j < n_ff; j += WARP_SIZE) {
-            m = fmaxf(m, fabsf(glu[s * n_ff + j]));
+#pragma unroll
+        for (int k = 0; k < CPE; ++k) {
+            m = fmaxf(m, fabsf(v[k]));
         }
         m = warp_reduce_max(m);
+        float e = ch.s1 * m + ch.b1;
+        e = logf(e);
+        e = ch.s2 * e + ch.b2;
+        e = ceilf(e);
+        e = fminf(fmaxf(e, ch.cmin), ch.cmax);
+        e = ch.s3 * e + ch.b3;
+        e = expf(e);
         if (lane == 0) {
-            float e = ch.s1 * m + ch.b1;
-            e = logf(e);
-            e = ch.s2 * e + ch.b2;
-            e = ceilf(e);
-            e = fminf(fmaxf(e, ch.cmin), ch.cmax);
-            e = ch.s3 * e + ch.b3;
-            e = expf(e);
             esc[s] = e;
             sids[s] = ids[s];
             sw[s] = wts[s];
         }
-    }
-    __syncthreads();
-    const int cpe = n_ff / QK8_1;
-    const int n_ce = n_used * cpe;
-    for (int c = warp; c < n_ce + n_ff_sh / QK8_1; c += NW) {
-        if (c < n_ce) {
-            const float x = glu[c * QK8_1 + lane] / esc[c / cpe];
-            frt_q8_1_chunk(x, lane, &yq_e[c]);
-        } else {
-            const int cs = c - n_ce;
-            frt_q8_1_chunk(glu[n_used * n_ff + cs * QK8_1 + lane], lane, &yq_s[cs]);
+#pragma unroll
+        for (int k = 0; k < CPE; ++k) {
+            frt_q8_1_chunk(v[k] / e, lane, &yq_e[s * CPE + k]);
+        }
+    } else {                           // remaining warps: shared-expert chunks
+        const float * gs = glu + n_used * n_ff;
+        for (int c0 = (warp - n_used) * CPE; c0 < n_ff_sh / QK8_1; c0 += (NW - n_used) * CPE) {
+            frt_q8_1_chunks<CPE>(gs, yq_s, c0, 1, lane);
         }
     }
     __syncthreads();
@@ -1004,7 +1207,8 @@ static bool frt_moeffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     // pinned shapes: K = n_embd = 2048, n_ff = 512, M = 1, even n_used <= 8
     if (gw->type != GGML_TYPE_NVFP4 || K != FRT_K_EMBD || n_ff != 512) return false;
     if (act->type != GGML_TYPE_F32 || act->ne[0] != K || act->ne[1] != 1 || act->ne[2] != 1 || !ggml_is_contiguous(act)) return false;
-    if (ids->type != GGML_TYPE_I32 || ids->ne[1] != 1 || n_used < 2 || n_used > FRT_MOE_MAX_USED || (n_used & 1)) return false;
+    // n_used < 8: the down kernel's prologue gives each routed slot a warp and needs one spare for the shared expert
+    if (ids->type != GGML_TYPE_I32 || ids->ne[1] != 1 || n_used < 2 || n_used >= FRT_MOE_MAX_USED || (n_used & 1)) return false;
     if (gate_id->ne[1] != n_used || gate_id->ne[2] != 1) return false;
 
     ggml_tensor * up_id = nullptr, * glu = nullptr, * down_id = nullptr, * ex = nullptr, * dv = nullptr;
@@ -1120,7 +1324,7 @@ static bool frt_moeffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     if (!resid || l_out->src[0] != ffn_out || resid->type != GGML_TYPE_F32 || !ggml_is_contiguous(resid) || resid->ne[0] != K || resid->ne[1] != 1) return false;
     if (l_out->type != GGML_TYPE_F32 || !ggml_is_contiguous(l_out) || l_out->ne[0] != K || l_out->ne[1] != 1) return false;
     if (n_used * n_ff + n_ff_sh > FRT_MOE_GLU_CAP) return false;
-    if (!frt_span_closed(cgraph, i, end, nullptr, nullptr)) return false;
+    if (!frt_span_closed(cgraph, i, end, {})) return false;
 
     const frt_moe_chain ch = {
         ggml_get_op_params_f32(sc[0], 0), ggml_get_op_params_f32(sc[0], 1),
@@ -1159,6 +1363,7 @@ bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     static const bool cc_ok = ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL;
     if (!cc_ok) return false;
     if (frt_attnqkv_try(ctx, cgraph, i, skip_count)) return true;
+    if (frt_route_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_oproj_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_moeffn_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_amax_try(ctx, cgraph, i, skip_count)) return true;
@@ -1172,5 +1377,8 @@ void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
         ggml_cuda_set_device(ctx.device);
         CUDA_CHECK(cudaMalloc(&g_moe_glu, FRT_MOE_GLU_CAP * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_qkv, FRT_QKV_ROWS_MAX * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_route_logits, 256 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_route_count, sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(g_route_count, 0, sizeof(unsigned int)));
     }
 }
