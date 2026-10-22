@@ -1848,10 +1848,10 @@ static bool frt_b_route_launch(ggml_backend_cuda_context & ctx, const frt_route_
     ggml_cuda_kernel_launch(frt_b_router<8>, ggml_cuda_kernel_launch_params((dim3) 32, (dim3) 256, 0, stream),
         (const float *) m.fn->data, (const nv_bfloat16 *) m.wr->data, (int64_t) (m.wr->nb[1] / sizeof(nv_bfloat16)), g_b_logits, m.T);
     float * chk = frt_b_check_begin(m.dv, i + 11, "route");
-    ggml_cuda_kernel_launch(frt_b_topk_group, ggml_cuda_kernel_launch_params((dim3) 1, (dim3) 256, 0, stream),
+    ggml_cuda_kernel_launch(frt_b_topk_group, ggml_cuda_kernel_launch_params((dim3) ((m.T + 7) / 8), (dim3) 256, 0, stream),
         (const float *) g_b_logits, m.T, m.n_used, m.clamp_val,
         (int32_t *) m.as->data, (int64_t) (m.as->nb[1] / sizeof(int32_t)), chk ? chk : (float *) m.dv->data, (int64_t) m.n_used,
-        g_b_ids, g_b_wts, g_b_eoff, g_b_slots, g_b_act);
+        g_b_ids, g_b_wts, g_b_eoff, g_b_slots, g_b_act, g_b_done);
     if (chk) return false;
     if (frt_h_check_on()) frt_h_check_route(stream, (const float *) m.fn->data, m.T, (const nv_bfloat16 *) m.wr->data, (int64_t) (m.wr->nb[1] / sizeof(nv_bfloat16)),
         m.n_used, m.clamp_val, (const int32_t *) m.as->data, (int64_t) (m.as->nb[1] / sizeof(int32_t)), (const float *) m.dv->data);
@@ -2273,9 +2273,14 @@ static bool frt_b_moeffn_launch(ggml_backend_cuda_context & ctx, const frt_moeff
         a.sh_out = g_b_glu + n_used * m.n_ff; a.sh_ld = ld_glu;
         a.n_rows = m.n_ff; a.sh_rows = m.n_ff_sh; a.T = T; a.n_used = n_used;
         a.tiles_r = (m.n_ff + NW * RPW - 1) / (NW * RPW); a.fzero = 0.0f;
-        const int grid = n_act_max * a.tiles_r + (m.n_ff_sh + NW * RPW - 1) / (NW * RPW);
-        ggml_cuda_kernel_launch(frt_b_moe_gemv<FRT_K_EMBD / 64, FRT_K_EMBD / 64, RPW, NW, TT, true>,
-            ggml_cuda_kernel_launch_params((dim3) grid, (dim3) (NW * WARP_SIZE), 0, stream), a);
+        if (!frt_b_dp4a()) {
+            a.tiles_r = (m.n_ff + FRT_M_ROWS - 1) / FRT_M_ROWS;
+            frt_m_moe_launch<FRT_K_EMBD / 64, FRT_K_EMBD / 64, 8, 1, true>(a, n_act_max, stream);
+        } else {
+            const int grid = n_act_max * a.tiles_r + (m.n_ff_sh + NW * RPW - 1) / (NW * RPW);
+            ggml_cuda_kernel_launch(frt_b_moe_gemv<FRT_K_EMBD / 64, FRT_K_EMBD / 64, RPW, NW, TT, true>,
+                ggml_cuda_kernel_launch_params((dim3) grid, (dim3) (NW * WARP_SIZE), 0, stream), a);
+        }
     }
     ggml_cuda_kernel_launch(frt_b_moe_glu_q8, ggml_cuda_kernel_launch_params((dim3) (T * (n_used + 1)), (dim3) 512, 0, stream),
         (const float *) g_b_glu, (int64_t) ld_glu, n_used, m.n_ff, m.n_ff_sh, m.ch, g_b_esc, g_b_gluq8, ld_q8);
@@ -2293,9 +2298,14 @@ static bool frt_b_moeffn_launch(ggml_backend_cuda_context & ctx, const frt_moeff
         a.sh_out = g_b_shpart; a.sh_ld = m.K;
         a.n_rows = m.K; a.sh_rows = m.K; a.T = T; a.n_used = n_used;
         a.tiles_r = (m.K + NW * RPW - 1) / (NW * RPW); a.fzero = 0.0f;
-        const int grid = n_act_max * a.tiles_r + (m.K + NW * RPW - 1) / (NW * RPW);
-        ggml_cuda_kernel_launch(frt_b_moe_gemv<512 / 64, 1024 / 64, RPW, NW, TT, false>,
-            ggml_cuda_kernel_launch_params((dim3) grid, (dim3) (NW * WARP_SIZE), 0, stream), a);
+        if (!frt_b_dp4a()) {
+            a.tiles_r = (m.K + FRT_M_ROWS - 1) / FRT_M_ROWS;
+            frt_m_moe_launch<512 / 64, 1024 / 64, 4, 1, false>(a, n_act_max, stream);
+        } else {
+            const int grid = n_act_max * a.tiles_r + (m.K + NW * RPW - 1) / (NW * RPW);
+            ggml_cuda_kernel_launch(frt_b_moe_gemv<512 / 64, 1024 / 64, RPW, NW, TT, false>,
+                ggml_cuda_kernel_launch_params((dim3) grid, (dim3) (NW * WARP_SIZE), 0, stream), a);
+        }
     }
     float * chk = frt_b_check_begin(m.l_out, m.end, "moeffn");
     ggml_cuda_kernel_launch(frt_b_moe_combine, ggml_cuda_kernel_launch_params(dim3(m.K / 256, T), (dim3) 256, 0, stream),

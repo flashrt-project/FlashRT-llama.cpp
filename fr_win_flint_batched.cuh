@@ -35,6 +35,7 @@ static block_q8_1   * g_b_gluq8  = nullptr;  // [T][n_used*16 + 32] routed slots
 static int32_t      * g_b_eoff   = nullptr;  // [257] expert -> first slot in g_b_slots
 static int32_t      * g_b_slots  = nullptr;  // [T*8] slot ids (t * 8 + k) grouped by expert
 static int32_t      * g_b_act    = nullptr;  // [258] active experts (count at [256])
+static unsigned int * g_b_done   = nullptr;  // top-k CTA completion counter
 static float        * g_b_part   = nullptr;  // [T][n_used][2048] routed down outputs (unscaled)
 static float        * g_b_shpart = nullptr;  // [T][2048] shared-expert down output (unscaled)
 
@@ -107,6 +108,8 @@ static void frt_b_alloc() {
     CUDA_CHECK(cudaMalloc(&g_b_eoff, 257 * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&g_b_slots, T * 8 * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&g_b_act, 258 * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&g_b_done, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(g_b_done, 0, sizeof(unsigned int)));
     CUDA_CHECK(cudaMalloc(&g_b_part, T * 8 * 2048 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&g_b_shpart, T * 2048 * sizeof(float)));
 }
@@ -278,12 +281,45 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE) frt_b_gemv(const frt_b_
     }
 }
 
+struct frt_b_moe_args {
+    const block_q8_1 * q8;      // routed: [T][ld_q8] (+ k * kq8 for slot k); shared: + sh_q8_off
+    int ld_q8, kq8, sh_q8_off;  // blocks
+    const int32_t * eoff, * slots, * act;
+    const char * w, * w2;       // routed weights (w2: up for GLU), expert e at + e * e_stride
+    size_t e_stride, row_stride, sh_row_stride;
+    const float * sc, * sc2;    // per-expert scales
+    const char * shw, * shw2;   // shared-expert weights
+    const float * shsc, * shsc2; // per-tensor scales
+    float * out;                // routed: out + t * ld_out + k * k_out + r
+    int64_t ld_out, k_out;
+    float * sh_out;             // shared: sh_out + t * sh_ld + r
+    int64_t sh_ld;
+    int n_rows, sh_rows;        // output rows per routed expert / of the shared expert
+    int T, n_used;
+    int tiles_r;                // row tiles per routed expert; shared tiles follow
+    float fzero;
+};
+
+#include "fr_win_flint_bmma.cuh"
+
+static bool frt_b_dp4a() {
+    static const bool on = getenv("FRT_B_DP4A") && getenv("FRT_B_DP4A")[0] == '1';
+    return on;
+}
+// sm_120 allows 99 KB of shared memory per block: token tiles of 32 / 16 / 8 for K = 2048 / 4096 / 6144
+template <int KB, int EPI> struct frt_m_ntt { static constexpr int v = KB <= 64 ? 2 : 1; };   // 16-token tiles (8 for K = 6144)
+template <int KB> struct frt_m_nw { static constexpr int v = KB <= 32 ? 8 : 16; };
+
 // token-tile size per K: keep the static shared buffer under 48 KB
 template <int KB> struct frt_b_tt { static constexpr int v = KB <= 16 ? 32 : KB <= 32 ? 16 : KB <= 64 ? 8 : 4; };
 
 template <int KB, int EPI>
 static void frt_b_gemv_launch(const frt_b_gemv_args & a, cudaStream_t stream) {
     constexpr int NW = FRT_B_NW, TT = frt_b_tt<KB>::v;
+    if (!frt_b_dp4a()) {
+        frt_m_gemv_launch<KB, frt_m_nw<KB>::v, frt_m_ntt<KB, EPI>::v, EPI>(a, stream);
+        return;
+    }
     // rows per warp: as many as keep >= ~256 CTAs
     const int rpw = a.n_rows >= 4096 * 1 ? 4 : a.n_rows >= 2048 ? 2 : 1;
     switch (rpw) {

@@ -8,6 +8,7 @@ static __global__ void __launch_bounds__(256) frt_b_router(const float * xn, con
         float * logits, const int T) {
     ggml_cuda_pdl_lc();
     constexpr int KP = FRT_K_EMBD / 2 / 256;   // bf16 pairs per thread per row
+    constexpr int TU = 4;                      // tokens per iteration (loads hoisted)
     const int tid = threadIdx.x, warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
     const int row0 = blockIdx.x * RPC;
     nv_bfloat162 wv[RPC][KP];
@@ -19,71 +20,92 @@ static __global__ void __launch_bounds__(256) frt_b_router(const float * xn, con
             wv[r][k] = x2[tid + 256 * k];
         }
     }
-    __shared__ float red[8][RPC];
+    __shared__ float red[TU][8][RPC];
     ggml_cuda_pdl_sync();
-    for (int t = 0; t < T; ++t) {
-        const float2 * y2 = (const float2 *) (xn + (int64_t) t * FRT_K_EMBD);
-        float2 yv[KP];
+    for (int t0 = 0; t0 < T; t0 += TU) {
+        float2 yv[TU][KP];
 #pragma unroll
-        for (int k = 0; k < KP; ++k) {
-            yv[k] = __ldcg(y2 + tid + 256 * k);
-        }
-        float sum[RPC];
-#pragma unroll
-        for (int r = 0; r < RPC; ++r) {
-            sum[r] = 0.0f;
+        for (int u = 0; u < TU; ++u) {
+            const int t = min(t0 + u, T - 1);
+            const float2 * y2 = (const float2 *) (xn + (int64_t) t * FRT_K_EMBD);
 #pragma unroll
             for (int k = 0; k < KP; ++k) {
-                ggml_cuda_mad(sum[r], wv[r][k].x, yv[k].x);
-                ggml_cuda_mad(sum[r], wv[r][k].y, yv[k].y);
+                yv[u][k] = __ldcg(y2 + tid + 256 * k);
             }
-            sum[r] = warp_reduce_sum<WARP_SIZE>(sum[r]);
         }
-        if (lane == 0) {
+#pragma unroll
+        for (int u = 0; u < TU; ++u) {
+            float sum[RPC];
 #pragma unroll
             for (int r = 0; r < RPC; ++r) {
-                red[warp][r] = sum[r];
+                sum[r] = 0.0f;
+#pragma unroll
+                for (int k = 0; k < KP; ++k) {
+                    ggml_cuda_mad(sum[r], wv[r][k].x, yv[u][k].x);
+                    ggml_cuda_mad(sum[r], wv[r][k].y, yv[u][k].y);
+                }
+                sum[r] = warp_reduce_sum<WARP_SIZE>(sum[r]);
+            }
+            if (lane == 0) {
+#pragma unroll
+                for (int r = 0; r < RPC; ++r) {
+                    red[u][warp][r] = sum[r];
+                }
             }
         }
         __syncthreads();
-        if (tid < RPC) {
-            float v = red[0][tid];
+        if (tid < TU * RPC) {
+            const int u = tid / RPC, r = tid % RPC;
+            const int t = t0 + u;
+            if (t < T) {
+                float v = red[u][0][r];
 #pragma unroll
-            for (int w = 1; w < 8; ++w) {
-                v += red[w][tid];
+                for (int w = 1; w < 8; ++w) {
+                    v += red[u][w][r];
+                }
+                logits[(int64_t) t * 256 + row0 + r] = v;
             }
-            logits[(int64_t) t * 256 + row0 + tid] = v;
         }
         __syncthreads();
     }
 }
 
-// top-k of every token (one warp each) followed by the expert grouping of the
-// T * n_used slots: eoff[e] .. eoff[e+1] index slots[] (slot = t * 8 + k),
-// act[0 .. n_active) lists the experts with at least one token. One CTA.
+// top-k of every token (one warp each, ceil(T/8) CTAs); the last CTA to finish
+// groups the T * n_used slots by expert: eoff[e] .. eoff[e+1] index slots[]
+// (slot = t * 8 + k), act[0 .. n_active) lists the experts with tokens.
 static __global__ void __launch_bounds__(256) frt_b_topk_group(const float * logits, const int T, const int n_used, const float clamp_val,
         int32_t * ids_out, const int64_t ids_stride, float * w_out, const int64_t w_stride,
-        int32_t * ids_snap, float * w_snap, int32_t * eoff, int32_t * slots, int32_t * act) {
+        int32_t * ids_snap, float * w_snap, int32_t * eoff, int32_t * slots, int32_t * act, unsigned int * done) {
     ggml_cuda_pdl_lc();
     __shared__ int cnt[256], cur[256], wsum[8];
     __shared__ int n_act;
+    __shared__ bool last;
     const int tid = threadIdx.x, warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
-    cnt[tid] = 0;
-    if (tid == 0) n_act = 0;
     ggml_cuda_pdl_sync();
-    __syncthreads();
-    for (int t = warp; t < T; t += 8) {
+    const int t = blockIdx.x * 8 + warp;
+    if (t < T) {
         frt_topk256_warp(logits + (int64_t) t * 256, n_used, clamp_val, 1.0f, lane,
                          ids_out + (int64_t) t * ids_stride, w_out + (int64_t) t * w_stride, ids_snap + t * 8, w_snap + t * 8);
     }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        last = atomicAdd(done, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+    cnt[tid] = 0;
+    if (tid == 0) n_act = 0;
     __syncthreads();
     const int n_slots = T * n_used;
     for (int s = tid; s < n_slots; s += 256) {
-        const int t = s / n_used, k = s % n_used;
-        atomicAdd(&cnt[ids_snap[t * 8 + k]], 1);
+        const int tt = s / n_used, k = s % n_used;
+        atomicAdd(&cnt[__ldcg(ids_snap + tt * 8 + k)], 1);
     }
     __syncthreads();
-    // exclusive scan of cnt[256]
     const int c = cnt[tid];
     int incl = c;
 #pragma unroll
@@ -107,11 +129,11 @@ static __global__ void __launch_bounds__(256) frt_b_topk_group(const float * log
         act[a] = tid;
     }
     __syncthreads();
-    if (tid == 0) act[256] = n_act;
+    if (tid == 0) { act[256] = n_act; *done = 0; }
     for (int s = tid; s < n_slots; s += 256) {
-        const int t = s / n_used, k = s % n_used;
-        const int pos = atomicAdd(&cur[ids_snap[t * 8 + k]], 1);
-        slots[pos] = t * 8 + k;
+        const int tt = s / n_used, k = s % n_used;
+        const int pos = atomicAdd(&cur[__ldcg(ids_snap + tt * 8 + k)], 1);
+        slots[pos] = tt * 8 + k;
     }
 }
 
@@ -119,24 +141,6 @@ static __global__ void __launch_bounds__(256) frt_b_topk_group(const float * log
 // CTA = (active expert, row tile) for the routed experts, or (row tile) for the
 // shared expert (expert index -1: all T tokens in order). Rows' NVFP4 fragments
 // stay in registers while the expert's tokens pass through shared memory.
-struct frt_b_moe_args {
-    const block_q8_1 * q8;      // routed: [T][ld_q8] (+ k * kq8 for slot k); shared: + sh_q8_off
-    int ld_q8, kq8, sh_q8_off;  // blocks
-    const int32_t * eoff, * slots, * act;
-    const char * w, * w2;       // routed weights (w2: up for GLU), expert e at + e * e_stride
-    size_t e_stride, row_stride, sh_row_stride;
-    const float * sc, * sc2;    // per-expert scales
-    const char * shw, * shw2;   // shared-expert weights
-    const float * shsc, * shsc2; // per-tensor scales
-    float * out;                // routed: out + t * ld_out + k * k_out + r
-    int64_t ld_out, k_out;
-    float * sh_out;             // shared: sh_out + t * sh_ld + r
-    int64_t sh_ld;
-    int n_rows, sh_rows;        // output rows per routed expert / of the shared expert
-    int T, n_used;
-    int tiles_r;                // row tiles per routed expert; shared tiles follow
-    float fzero;
-};
 
 template <int KB, int KBS, int RPW, int NW, int TT, bool GLU>
 static __global__ void __launch_bounds__(NW * WARP_SIZE) frt_b_moe_gemv(const frt_b_moe_args a) {
