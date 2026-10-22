@@ -1,4 +1,4 @@
-From 9d0045822fc22bebf0d37f7199822274cf19c5f4 Mon Sep 17 00:00:00 2001
+From 269d226565f17e1678cbd0d72f7487a7557d1118 Mon Sep 17 00:00:00 2001
 From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Wed, 21 Oct 2026 20:44:08 -0400
 Subject: [PATCH 7/8] kv-cache: fill the reused rows of the KQ mask in parallel

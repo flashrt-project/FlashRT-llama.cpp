@@ -1,4 +1,4 @@
-From 2ae09e4e8b98216be9b42068de2fde2cc003f4ec Mon Sep 17 00:00:00 2001
+From 6f2b6f50bb23976f5d11d6213822941d54247a89 Mon Sep 17 00:00:00 2001
 From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Wed, 21 Oct 2026 21:47:25 -0400
 Subject: [PATCH 8/8] llama: keep the scheduler when a re-reserve keeps the

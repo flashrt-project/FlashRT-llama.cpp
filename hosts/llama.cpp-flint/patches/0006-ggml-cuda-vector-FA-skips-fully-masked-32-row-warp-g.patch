@@ -1,4 +1,4 @@
-From c9d32d565777531b0eef1967c36a267d963b2db9 Mon Sep 17 00:00:00 2001
+From 5e830affab555b4d4cfc479ae0ba4ecb47a33877 Mon Sep 17 00:00:00 2001
 From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Wed, 21 Oct 2026 20:34:47 -0400
 Subject: [PATCH 6/8] ggml-cuda: vector FA skips fully masked 32-row warp

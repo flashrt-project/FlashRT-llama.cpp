@@ -21,7 +21,9 @@ if [ ! -d "$work/.git" ]; then
     git clone -q "$src" "$work"
 fi
 cd "$work"
-git cat-file -e "$pin^{commit}" 2>/dev/null || git fetch -q origin pull/30928/head
+# the pin is the Flint PR head; fetch it by hash, falling back to the PR ref
+git cat-file -e "$pin^{commit}" 2>/dev/null || git fetch -q origin "$pin" 2>/dev/null \
+    || git fetch -q origin pull/30928/head
 git checkout -q --detach "$pin"
 git am -q --3way "$here"/patches/*.patch
 rm -rf ggml/src/ggml-cuda/flashrt

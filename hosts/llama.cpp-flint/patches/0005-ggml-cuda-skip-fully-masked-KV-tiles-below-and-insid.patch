@@ -1,4 +1,4 @@
-From 02064a15bf819a4ddb9af194d4c88dfa28b48cf2 Mon Sep 17 00:00:00 2001
+From 711add642d22fb4ebe82255ec32a81e7de9fff01 Mon Sep 17 00:00:00 2001
 From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Wed, 21 Oct 2026 20:12:36 -0400
 Subject: [PATCH 5/8] ggml-cuda: skip fully masked KV tiles below and inside
