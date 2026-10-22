@@ -17,7 +17,8 @@
 #include <map>
 #include <string>
 
-static constexpr int FRT_B_TMAX = 128;   // tokens per ubatch handled by the batched windows
+static constexpr int FRT_B_TMAX = 512;         // tokens per ubatch handled by the routing / MoE windows (buffers)
+static constexpr int FRT_B_DENSE_TMAX = 128;   // dense projections / attention front / LM head: beyond this stock MMQ is the better GEMM
 static constexpr int FRT_B_NW   = 4;     // warps per GEMV CTA
 
 // ---- private buffers --------------------------------------------------------

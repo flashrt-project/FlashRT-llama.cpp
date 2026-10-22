@@ -714,7 +714,7 @@ static bool frt_attnqkv_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     const ggml_tensor * x = rn->src[0];
     if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(x)) return false;
     const int T = (int) ggml_nrows(x);   // tokens of the ubatch: 1 = decode windows, 2..FRT_B_TMAX = batched windows
-    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
+    if (T < 1 || T > FRT_B_DENSE_TMAX || (T > 1 && !frt_b_on())) return false;
     const ggml_tensor * nw = an->src[1];
     if (nw->type != GGML_TYPE_F32 || nw->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(nw)) return false;
     if (!frt_aligned16(x->data) || !frt_aligned16(nw->data)) return false;
@@ -928,7 +928,7 @@ static bool frt_oproj_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
     if (w->type != GGML_TYPE_NVFP4 || w->ne[0] != 4096 || !ggml_is_contiguous(w)) return false;
     if (a->type != GGML_TYPE_F32 || a->ne[0] != 4096 || !ggml_is_contiguous(a)) return false;
     const int T = (int) ggml_nrows(a);
-    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
+    if (T < 1 || T > FRT_B_DENSE_TMAX || (T > 1 && !frt_b_on())) return false;
     const ggml_tensor * smul = cgraph->nodes[i + 1];
     const ggml_tensor * s = frt_mm_scale_src(smul, mm);
     if (!s) return false;
@@ -950,7 +950,7 @@ static bool frt_oproj_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
         if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || g0->type != GGML_TYPE_F32 || g1->type != GGML_TYPE_F32 ||
             ggml_nrows(g1->src[0]) != T || g1->src[0]->type != GGML_TYPE_F32) return false;
         T_out = (int) ggml_nelements(ids);
-        if (T_out < 1 || T_out > FRT_B_TMAX || ggml_nrows(g0) != T_out || ggml_nrows(g1) != T_out) return false;
+        if (T_out < 1 || T_out > FRT_B_DENSE_TMAX || ggml_nrows(g0) != T_out || ggml_nrows(g1) != T_out) return false;
         if (T == 1 && T_out != 1) return false;
         if (!frt_node_ok(cgraph, i + 2, GGML_OP_GET_ROWS, 1) || !frt_node_ok(cgraph, i + 3, GGML_OP_GET_ROWS, 1)) return false;
         resid = g1->src[0];
@@ -1123,7 +1123,7 @@ static bool frt_denseffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     const ggml_tensor * gw = gm->src[0], * uw = um->src[0], * dw = dm->src[0];
     if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
     const int T = (int) ggml_nrows(x);
-    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
+    if (T < 1 || T > FRT_B_DENSE_TMAX || (T > 1 && !frt_b_on())) return false;
     if (nw->type != GGML_TYPE_F32 || nw->ne[0] != FRT_K_EMBD || ggml_nrows(nw) != 1 || !ggml_is_contiguous(nw) || !frt_aligned16(nw->data)) return false;
     if (nm->ne[0] != FRT_K_EMBD || ggml_nrows(nm) != T) return false;
     for (const ggml_tensor * w : { gw, uw }) {
@@ -1244,7 +1244,7 @@ static bool frt_lmhead_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     const ggml_tensor * x = rn->src[0], * nw = nm->src[1], * w = mm->src[0];
     if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
     const int T = (int) ggml_nrows(x);
-    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
+    if (T < 1 || T > FRT_B_DENSE_TMAX || (T > 1 && !frt_b_on())) return false;
     if (nw->type != GGML_TYPE_F32 || ggml_nelements(nw) != FRT_K_EMBD || !ggml_is_contiguous(nw) || !frt_aligned16(nw->data)) return false;
     if (nm->type != GGML_TYPE_F32 || ggml_nrows(nm) != T || !ggml_is_contiguous(nm) || !frt_aligned16(nm->data)) return false;
     if (w->type != GGML_TYPE_NVFP4 || w->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(w)) return false;
@@ -1797,7 +1797,8 @@ static bool frt_route_match(ggml_cgraph * cgraph, int i, frt_route_m & m) {
     const ggml_tensor * x = rn->src[0], * nw = fn->src[1], * wr = mm->src[0];
     if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
     const int T = (int) ggml_nrows(x);
-    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
+    static const int route_max_t = getenv("FRT_B_MOE_MAX_T") ? atoi(getenv("FRT_B_MOE_MAX_T")) : 128;
+    if (T < 1 || T > FRT_B_TMAX || (T > 1 && (!frt_b_on() || T > route_max_t))) return false;
     if (nw->type != GGML_TYPE_F32 || ggml_nelements(nw) != FRT_K_EMBD || !frt_aligned16(nw->data)) return false;
     if (fn->type != GGML_TYPE_F32 || !ggml_is_contiguous(fn) || !frt_aligned16(fn->data)) return false;
     if (wr->type != GGML_TYPE_BF16 || wr->ne[0] != FRT_K_EMBD || wr->ne[1] != 256 || !ggml_is_contiguous(wr)) return false;
@@ -2393,7 +2394,9 @@ static bool frt_moeffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     g_act_q8_src = nullptr;
     if (m.T > 1) {
         static const int min_t = getenv("FRT_B_MOE_MIN_T") ? atoi(getenv("FRT_B_MOE_MIN_T")) : 9;
+        static const int max_t = getenv("FRT_B_MOE_MAX_T") ? atoi(getenv("FRT_B_MOE_MAX_T")) : 128;
         if (m.T < min_t) return false;   // stock's per-slot MMVQ streams small batches faster (T <= 8)
+        if (m.T > max_t) return false;   // prompt-sized ubatches: stock MMQ is the better grouped GEMM (pp2048 7350 vs 5880 tok/s)
         if (!act_q8) return false;   // the batched span needs ROUTE's q8 activation and expert grouping
         if (m.n_ff_sh != 1024 || m.K % 256 != 0) return false;
         if (!frt_b_moeffn_launch(ctx, m, i)) return false;
@@ -2873,7 +2876,7 @@ static bool frt_attndec_plan(const ggml_cgraph * cgraph, const int i, frt_fa_pla
     if (Q->type != GGML_TYPE_F32 || Q->ne[0] != FRT_FA_D || Q->ne[1] != 1 || Q->nb[0] != sizeof(float)) return false;
     // batched decode: one token per sequence, Q [D, 1, H, n_seq], K/V [D, n_kv, Hkv, n_seq] (per-sequence cache slots)
     const int n_seq = (int) Q->ne[3];
-    if (n_seq < 1 || n_seq > FRT_B_TMAX || (n_seq > 1 && (!frt_b_on() || K->ne[3] != n_seq || V->ne[3] != n_seq))) return false;
+    if (n_seq < 1 || n_seq > FRT_B_DENSE_TMAX || (n_seq > 1 && (!frt_b_on() || K->ne[3] != n_seq || V->ne[3] != n_seq))) return false;
     if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || K->ne[0] != FRT_FA_D || V->ne[0] != FRT_FA_D) return false;
     if (K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) || K->nb[1] != V->nb[1] || K->nb[2] != V->nb[2] || K->nb[3] != V->nb[3]) return false;
     if (K->ne[1] != V->ne[1] || K->ne[2] != V->ne[2] || K->ne[3] != n_seq || Q->ne[2] != K->ne[2] * FRT_FA_G) return false;
