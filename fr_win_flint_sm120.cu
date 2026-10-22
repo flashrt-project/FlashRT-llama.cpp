@@ -1193,7 +1193,7 @@ static float * g_pf_moe = nullptr;   // routed sum [n_embd, T], private (x may s
 // FRT_PF_CHECK=1 (eager test aid): compute into private buffers, let ggml run the nodes, compare at the next node
 struct frt_pf_check_state { const ggml_tensor * lo = nullptr; float * mine_out = nullptr, * pg = nullptr, * pu = nullptr, * pglu = nullptr, * pd = nullptr; int64_t n = 0; };
 static frt_pf_check_state g_pf_chk;
-static constexpr int64_t FRT_PF_TOKENS_MAX = 4096;   // prefill windows: ubatch <= 4096
+static constexpr int64_t FRT_PF_TOKENS_MAX = 8192;   // prefill windows: ubatch <= 8192
 
 // moe[t][r] = sum_k ((x[t][k][r] * s[ids[t][k]]) * e[t][k]) * w[t][k], k ascending.
 // ggml runs the products and the sum as separate kernels: __fmul_rn / __fadd_rn keep the
