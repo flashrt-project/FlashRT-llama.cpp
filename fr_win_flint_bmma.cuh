@@ -33,9 +33,15 @@ template <int KB> struct frt_m_tok { static constexpr int bytes = 2 * KB * (int)
 // weights), reused for every token tile.
 template <int KBW, bool GLU>
 struct frt_m_wreg {
-    uint32_t q[2][KBW][4], sc[2][KBW];
+    uint32_t q[2][KBW][4], sc[2][KBW];   // q: this lane's int8 A fragment per (block, sub-block), already expanded
     uint32_t q2[GLU ? 2 : 1][GLU ? KBW : 1][4], sc2[GLU ? 2 : 1][GLU ? KBW : 1];
 };
+
+// nibbles (int) -> the lane's 4 int8 weights: low nibbles for lanes c < 2, high nibbles for c >= 2
+static __device__ __forceinline__ uint32_t frt_m_expand(const uint32_t q, const bool hi) {
+    const int2 l = get_int_from_table_16((int) q, kvalues_mxfp4);
+    return (uint32_t) (hi ? l.y : l.x);
+}
 
 template <int KB, int KBW, int NW, bool GLU>
 static __device__ __forceinline__ void frt_m_load(frt_m_wreg<KBW, GLU> & w, const char * wa, const char * wb,
@@ -99,16 +105,12 @@ static __device__ __forceinline__ void frt_m_rows(const frt_m_wreg<KBWS, GLU> & 
         }
 #pragma unroll
         for (int sb = 0; sb < 4; ++sb) {
-            const int2 la = get_int_from_table_16((int) w.q[0][k][sb], kvalues_mxfp4);
-            const int2 lb = get_int_from_table_16((int) w.q[1][k][sb], kvalues_mxfp4);
-            const uint32_t a0 = (uint32_t) (hi ? la.y : la.x), a1 = (uint32_t) (hi ? lb.y : lb.x);
+            const uint32_t a0 = frt_m_expand(w.q[0][k][sb], hi), a1 = frt_m_expand(w.q[1][k][sb], hi);
             const float dra = ggml_cuda_ue4m3_to_fp32((uint8_t) (w.sc[0][k] >> (8 * sb)));
             const float drb = ggml_cuda_ue4m3_to_fp32((uint8_t) (w.sc[1][k] >> (8 * sb)));
             uint32_t a02 = 0, a12 = 0; float dra2 = 0.0f, drb2 = 0.0f;
             if constexpr (GLU) {
-                const int2 la2 = get_int_from_table_16((int) w.q2[0][k][sb], kvalues_mxfp4);
-                const int2 lb2 = get_int_from_table_16((int) w.q2[1][k][sb], kvalues_mxfp4);
-                a02 = (uint32_t) (hi ? la2.y : la2.x); a12 = (uint32_t) (hi ? lb2.y : lb2.x);
+                a02 = frt_m_expand(w.q2[0][k][sb], hi); a12 = frt_m_expand(w.q2[1][k][sb], hi);
                 dra2 = ggml_cuda_ue4m3_to_fp32((uint8_t) (w.sc2[0][k] >> (8 * sb)));
                 drb2 = ggml_cuda_ue4m3_to_fp32((uint8_t) (w.sc2[1][k] >> (8 * sb)));
             }

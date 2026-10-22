@@ -2480,10 +2480,17 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
         const char * K, const char * V, const int64_t kv_row, const int64_t kv_head,   // f16 rows
         const half * mask, const float scale, const int n_kv,
         frt_fa_part * part_ml, float * part_o, const int n_split,
-        const float * qkv, const frt_qkn_params qp, const int steps, const bool prestage_ok, const int pfd) {
+        const float * qkv, const frt_qkn_params qp, const int steps, const bool prestage_ok, const int pfd,
+        const int64_t q_seq, const int64_t kv_seq, const int64_t mask_seq, const int n_split_total) {
     constexpr int D = FRT_FA_D;
     const int CH = FRT_FA_STEP * steps;   // KV rows per CTA
     const bool prestage = QKN != 0 && prestage_ok;
+    // sequence blockIdx.z (batched decode: one query token per sequence, its own KV rows and mask row)
+    const int seq = blockIdx.z;
+    Q += (int64_t) seq * q_seq;
+    K += (int64_t) seq * kv_seq;
+    V += (int64_t) seq * kv_seq;
+    mask += (int64_t) seq * mask_seq;
     extern __shared__ __align__(16) char frt_fa_dsm[];
     typedef half frt_tile_t[FRT_FA_STEP][FRT_FA_PITCH];
     frt_tile_t * sKb = (frt_tile_t *) frt_fa_dsm;   // [NS] K tiles, then [NS] V tiles
@@ -2600,10 +2607,11 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
         }
     }
     __syncthreads();   // sQ / sNK / sNV
-    frt_fa_part * pml = part_ml + (int64_t) (g * FRT_FA_G) * n_split + split;
+    const int fsplit = seq * n_split + split;   // flat split index over (sequence, chunk)
+    frt_fa_part * pml = part_ml + (int64_t) (g * FRT_FA_G) * n_split_total + fsplit;
     if (!chunk_live) {   // fully masked chunk
         if (threadIdx.x < FRT_FA_G) {
-            pml[(int64_t) threadIdx.x * n_split] = { -INFINITY, 0.0f };
+            pml[(int64_t) threadIdx.x * n_split_total] = { -INFINITY, 0.0f };
         }
         return;
     }
@@ -2765,7 +2773,7 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
         for (int w = 0; w < FRT_FA_NW; ++w) {
             acc += so[(w * FRT_FA_G + hh) * D + d];
         }
-        part_o[((int64_t) (g * FRT_FA_G + hh) * n_split + split) * D + d] = acc;
+        part_o[((int64_t) (g * FRT_FA_G + hh) * n_split_total + fsplit) * D + d] = acc;
     }
     if (threadIdx.x < FRT_FA_G) {
         const int hh = threadIdx.x;
@@ -2778,7 +2786,7 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
         for (int w = 0; w < FRT_FA_NW; ++w) {
             L += MM == -INFINITY ? 0.0f : sm_l[w][hh] * expf(sm_m[w][hh] - MM);
         }
-        pml[(int64_t) hh * n_split] = { MM, L };
+        pml[(int64_t) hh * n_split_total] = { MM, L };
     }
 }
 
@@ -2787,15 +2795,16 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
 // (broadcast loads) and its own O column, CH partials per batch of
 // independent loads, merged with an online max rescale.
 static __global__ void frt_fa_combine(const frt_fa_part * part_ml, const float * part_o, const float * sinks,
-        float * dst, const int64_t dst_head_stride, const int n_split) {
+        float * dst, const int64_t dst_head_stride, const int n_split, const int n_split_total, const int64_t dst_seq) {
     ggml_cuda_pdl_lc();
     constexpr int D = FRT_FA_D;
     constexpr int CH = 32;
-    const int h = blockIdx.x, d = threadIdx.x;
+    const int h = blockIdx.x, d = threadIdx.x, seq = blockIdx.y;
     const float sink = sinks ? sinks[h] : -INFINITY;   // immutable
     ggml_cuda_pdl_sync();
-    const frt_fa_part * pm = part_ml + (int64_t) h * n_split;
-    const float * po = part_o + (int64_t) h * n_split * D + d;
+    dst += (int64_t) seq * dst_seq;
+    const frt_fa_part * pm = part_ml + (int64_t) h * n_split_total + (int64_t) seq * n_split;
+    const float * po = part_o + ((int64_t) h * n_split_total + (int64_t) seq * n_split) * D + d;
     float M = sink, L = sinks ? 1.0f : 0.0f, acc = 0.0f;   // the sink adds exp(sink - M) to the denominator only
     for (int j0 = 0; j0 < n_split; j0 += CH) {
         frt_fa_part q[CH];
@@ -2843,10 +2852,12 @@ static bool frt_attndec_on() {
     return on && g_fa_ml != nullptr;
 }
 
+struct frt_fa_plan_seq { int n_seq; int64_t q_seq, kv_seq, mask_seq, dst_seq; };
 struct frt_fa_plan {
     const ggml_tensor * Q, * K, * V, * mask, * sinks;
     float scale;
     int n_kv, steps, n_split, ns;
+    frt_fa_plan_seq sq;
 };
 
 static bool frt_attndec_plan(const ggml_cgraph * cgraph, const int i, frt_fa_plan & pl) {
@@ -2859,12 +2870,25 @@ static bool frt_attndec_plan(const ggml_cgraph * cgraph, const int i, frt_fa_pla
     if ((nxt->op != GGML_OP_RESHAPE && nxt->op != GGML_OP_VIEW) || nxt->src[0] != fa) return false;
     const ggml_tensor * Q = fa->src[0], * K = fa->src[1], * V = fa->src[2], * mask = fa->src[3], * sinks = fa->src[4];
     // Q [D, 1 token, H], K/V [D, n_kv, Hkv] f16 views of the cache, mask [n_kv, >=1] f16
-    if (Q->type != GGML_TYPE_F32 || Q->ne[0] != FRT_FA_D || Q->ne[1] != 1 || Q->ne[3] != 1 || Q->nb[0] != sizeof(float)) return false;
+    if (Q->type != GGML_TYPE_F32 || Q->ne[0] != FRT_FA_D || Q->ne[1] != 1 || Q->nb[0] != sizeof(float)) return false;
+    // batched decode: one token per sequence, Q [D, 1, H, n_seq], K/V [D, n_kv, Hkv, n_seq] (per-sequence cache slots)
+    const int n_seq = (int) Q->ne[3];
+    if (n_seq < 1 || n_seq > FRT_B_TMAX || (n_seq > 1 && (!frt_b_on() || K->ne[3] != n_seq || V->ne[3] != n_seq))) return false;
     if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || K->ne[0] != FRT_FA_D || V->ne[0] != FRT_FA_D) return false;
-    if (K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) || K->nb[1] != V->nb[1] || K->nb[2] != V->nb[2]) return false;
-    if (K->ne[1] != V->ne[1] || K->ne[2] != V->ne[2] || K->ne[3] != 1 || Q->ne[2] != K->ne[2] * FRT_FA_G) return false;
+    if (K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) || K->nb[1] != V->nb[1] || K->nb[2] != V->nb[2] || K->nb[3] != V->nb[3]) return false;
+    if (K->ne[1] != V->ne[1] || K->ne[2] != V->ne[2] || K->ne[3] != n_seq || Q->ne[2] != K->ne[2] * FRT_FA_G) return false;
     if (Q->ne[2] > FRT_FA_HEADS_MAX) return false;
     if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->nb[0] != sizeof(half)) return false;
+    frt_fa_plan_seq sq = { n_seq, 0, 0, 0, 0 };
+    if (n_seq > 1) {
+        sq.q_seq = Q->nb[3] / sizeof(float);
+        sq.kv_seq = K->nb[3];
+        if (mask->ne[3] == n_seq) sq.mask_seq = mask->nb[3] / sizeof(half);
+        else if (mask->ne[3] == 1 && mask->ne[2] == 1 && mask->ne[1] >= n_seq) sq.mask_seq = mask->nb[1] / sizeof(half);
+        else return false;
+        if (fa->ne[3] != n_seq || fa->ne[2] != 1) return false;
+        sq.dst_seq = fa->nb[3] / sizeof(float);
+    }
     if (sinks && (sinks->type != GGML_TYPE_F32 || ggml_nelements(sinks) != Q->ne[2])) return false;
     if (fa->type != GGML_TYPE_F32 || fa->ne[0] != FRT_FA_D || !ggml_is_contiguous(fa)) return false;
     float scale, max_bias, softcap;
@@ -2889,11 +2913,16 @@ static bool frt_attndec_plan(const ggml_cgraph * cgraph, const int i, frt_fa_pla
     // long caches: double-buffered tiles, one CTA per SM (two tile buffers per CTA)
     static const int long_tiles = getenv("FRT_ATTNDEC_LONG_TILES") ? atoi(getenv("FRT_ATTNDEC_LONG_TILES")) : 256;
     static const int long_ctas  = getenv("FRT_ATTNDEC_LONG_CTAS") ? atoi(getenv("FRT_ATTNDEC_LONG_CTAS")) : nsm;
-    const bool lng = long_tiles > 0 && tiles >= long_tiles;
-    const int max_split = std::max(1, std::min(FRT_FA_MAX_SPLITS, (lng ? long_ctas : target_ctas) / (int) K->ne[2]));
+    // batched sequences: aim at ~4 CTAs per SM over (sequence, KV head, chunk) and double-buffer the tiles
+    static const int b_ctas = getenv("FRT_B_ATTN_CTAS") ? atoi(getenv("FRT_B_ATTN_CTAS")) : 4 * nsm;
+    const bool lng = n_seq > 1 ? false : (long_tiles > 0 && tiles >= long_tiles);
+    const int ctas = n_seq > 1 ? b_ctas : (lng ? long_ctas : target_ctas);
+    const int max_split = std::max(1, std::min(FRT_FA_MAX_SPLITS / n_seq, ctas / ((int) K->ne[2] * n_seq)));
     const int steps = (tiles + max_split - 1) / max_split;
     const int n_split = (tiles + steps - 1) / steps;
-    pl = { Q, K, V, mask, sinks, scale, n_kv, steps, n_split, lng ? 2 : 1 };
+    static const int b_ns = getenv("FRT_B_ATTN_NS") ? atoi(getenv("FRT_B_ATTN_NS")) : 2;
+    const int ns = n_seq > 1 ? (steps >= 2 ? b_ns : 1) : (lng ? 2 : 1);
+    pl = { Q, K, V, mask, sinks, scale, n_kv, steps, n_split, ns, sq };
     return true;
 }
 
@@ -2906,7 +2935,10 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     ggml_tensor * fa = cgraph->nodes[i];
     const bool fused = g_fa_pend.fa != nullptr && g_fa_pend.fa == fa;
     frt_fa_plan pl;
-    if (!frt_attndec_on() || !frt_attndec_plan(cgraph, i, pl)) {
+    static const bool batched_attn = !(getenv("FRT_B_ATTN") && getenv("FRT_B_ATTN")[0] == '0');
+    // batched decode attention wins over stock's f16 mma kernel up to ~32 sequences (measured: 64 x 1K rows is slower)
+    static const int b_attn_max_seq = getenv("FRT_B_ATTN_MAX_SEQ") ? atoi(getenv("FRT_B_ATTN_MAX_SEQ")) : 32;
+    if (!frt_attndec_plan(cgraph, i, pl) || !(pl.sq.n_seq > 1 ? (batched_attn && pl.sq.n_seq <= b_attn_max_seq) : frt_attndec_on())) {
         GGML_ASSERT(!fused && "ATTNQKV deferred its epilogue to an attention node ATTNDEC cannot take");
         return false;
     }
@@ -2915,8 +2947,10 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     g_fa_pend.fa = nullptr;
     const ggml_tensor * Q = pl.Q, * K = pl.K, * V = pl.V;
     const int n_kv = pl.n_kv, steps = pl.steps, n_split = pl.n_split;
+    const int n_seq = pl.sq.n_seq, n_split_total = n_seq * n_split;
+    GGML_ASSERT(qkn == 0 || n_seq == 1);
     cudaStream_t stream = ctx.stream();
-    const dim3 grid((unsigned) n_split, (unsigned) K->ne[2]);
+    const dim3 grid((unsigned) n_split, (unsigned) K->ne[2], (unsigned) n_seq);
     const ggml_cuda_kernel_launch_params lp(grid, (dim3) (FRT_FA_NW * WARP_SIZE), (size_t) (pl.ns * FRT_FA_TILE_BYTES), stream);
     static const int pfd = getenv("FRT_ATTNDEC_PFD") ? atoi(getenv("FRT_ATTNDEC_PFD")) : 2;
     // first-step staging before the dependency wait pays off while the grid
@@ -2926,7 +2960,8 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     auto launch = [&](auto kernel) {
         ggml_cuda_kernel_launch(kernel, lp, (const float *) Q->data, (int64_t) (Q->nb[2] / sizeof(float)),
             (const char *) K->data, (const char *) V->data, (int64_t) K->nb[1], (int64_t) K->nb[2],
-            (const half *) pl.mask->data, pl.scale, n_kv, g_fa_ml, g_fa_o, n_split, (const float *) g_qkv, qp, steps, prestage, pfd);
+            (const half *) pl.mask->data, pl.scale, n_kv, g_fa_ml, g_fa_o, n_split, (const float *) g_qkv, qp, steps, prestage, pfd,
+            pl.sq.q_seq, pl.sq.kv_seq, pl.sq.mask_seq, n_split_total);
     };
     static const bool pf = !(getenv("FRT_ATTNDEC_PF") && getenv("FRT_ATTNDEC_PF")[0] == '0');   // measured: prefetch on is faster
     auto launch_ns = [&](auto k1, auto k2) {
@@ -2961,9 +2996,9 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
         (ncall++ % check) == 0) {
         CUDA_CHECK(cudaMalloc(&chk, ggml_nbytes(fa)));
     }
-    ggml_cuda_kernel_launch(frt_fa_combine, ggml_cuda_kernel_launch_params((dim3) (unsigned) Q->ne[2], (dim3) FRT_FA_D, 0, stream),
+    ggml_cuda_kernel_launch(frt_fa_combine, ggml_cuda_kernel_launch_params(dim3((unsigned) Q->ne[2], (unsigned) n_seq), (dim3) FRT_FA_D, 0, stream),
         (const frt_fa_part *) g_fa_ml, (const float *) g_fa_o, pl.sinks ? (const float *) pl.sinks->data : (const float *) nullptr,
-        chk ? chk : (float *) fa->data, (int64_t) (fa->nb[1] / sizeof(float)), n_split);
+        chk ? chk : (float *) fa->data, (int64_t) (fa->nb[1] / sizeof(float)), n_split, n_split_total, pl.sq.dst_seq);
     if (chk) {
         // reference: ggml's own kernel choice, or (FRT_ATTNDEC_CHECK_REF=vec) always its f32 vector kernel,
         // which stock skips for GQA > 4 from 8K cached tokens in favour of the f16 tensor-core kernel
@@ -2980,7 +3015,7 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
         double md = 0, mr = 0, nb = 0;
         for (size_t k = 0; k < a.size(); ++k) { md = std::max(md, (double) fabsf(a[k] - b[k])); nb = std::max(nb, (double) fabsf(b[k])); }
         mr = md / std::max(nb, 1e-20);
-        fprintf(stderr, "frt-attndec-check %s n_kv=%d splits=%d steps=%d ns=%d qkn=%d max|d|=%.3g max|ref|=%.3g rel=%.3g\n", fa->name, n_kv, n_split, steps, pl.ns, qkn, md, nb, mr);
+        fprintf(stderr, "frt-attndec-check %s n_seq=%d n_kv=%d splits=%d steps=%d ns=%d qkn=%d max|d|=%.3g max|ref|=%.3g rel=%.3g\n", fa->name, n_seq, n_kv, n_split, steps, pl.ns, qkn, md, nb, mr);
         CUDA_CHECK(cudaFree(chk));
     }
     *skip_count = 2;
