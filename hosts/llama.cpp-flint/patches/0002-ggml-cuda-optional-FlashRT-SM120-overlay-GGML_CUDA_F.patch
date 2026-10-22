@@ -1,0 +1,106 @@
+From 277d0c99c543f756adb357bd52e9b38321067850 Mon Sep 17 00:00:00 2001
+From: LiangSu8899 <7thuniversels@gmail.com>
+Date: Wed, 21 Oct 2026 19:22:51 -0400
+Subject: [PATCH 2/7] ggml-cuda: optional FlashRT SM120 overlay
+ (GGML_CUDA_FLASHRT_SM120)
+
+Fuse hook at the top of ggml_cuda_try_fuse and an eager pre-capture hook in
+graph compute; the overlay sources are compiled only when the CMake option
+is on. GGML_CUDA_FLASHRT_DISABLE=1 keeps the stock path at runtime.
+
+---
+ ggml/src/ggml-cuda/CMakeLists.txt | 22 ++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu   | 21 +++++++++++++++++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 297d9ff..c86f34c 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -127,11 +127,33 @@ if (CUDAToolkit_FOUND)
+     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+ 
++    # FlashRT-llama.cpp overlay, SM120 target: the window/matcher translation
++    # unit comes from the overlay checkout (submodule at flashrt/ by default,
++    # GGML_CUDA_FLASHRT_DIR to override). Compiled out unless enabled.
++    if (GGML_CUDA_FLASHRT_SM120)
++        if (GGML_CUDA_FLASHRT_DIR)
++            set(FLASHRT_DIR "${GGML_CUDA_FLASHRT_DIR}")
++        else()
++            set(FLASHRT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flashrt")
++        endif()
++        if (NOT EXISTS "${FLASHRT_DIR}/fr_win_flint_sm120.cu")
++            message(FATAL_ERROR "GGML_CUDA_FLASHRT_SM120: FlashRT-llama.cpp overlay not found at ${FLASHRT_DIR} (git submodule update --init --recursive, or set GGML_CUDA_FLASHRT_DIR)")
++        endif()
++        set(FLASHRT_SM120_SOURCES ${FLASHRT_DIR}/fr_win_flint_sm120.cu)
++        list(APPEND GGML_SOURCES_CUDA ${FLASHRT_SM120_SOURCES})
++    endif()
++
+     ggml_add_backend_library(ggml-cuda
+                              ${GGML_HEADERS_CUDA}
+                              ${GGML_SOURCES_CUDA}
+                             )
+ 
++    if (GGML_CUDA_FLASHRT_SM120)
++        add_compile_definitions(GGML_CUDA_FLASHRT_SM120)
++        target_include_directories(ggml-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${FLASHRT_DIR})
++        message(STATUS "GGML_CUDA_FLASHRT_SM120: enabled (overlay at ${FLASHRT_DIR})")
++    endif()
++
+     if (GGML_CUDA_GRAPHS)
+         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
+     endif()
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f6ff9f8..8c7f44e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3770,12 +3770,25 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ }
+ 
+ // try and fuse nodes and return the number of nodes to skip
++#ifdef GGML_CUDA_FLASHRT_SM120
++bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count);
++#endif
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     if (ggml_cuda_fusion_disabled()) {
+         return 0;
+     }
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++    {   // FlashRT-llama.cpp windows: a matched span returns the number of nodes it consumed
++        int frt_skip = 0;
++        if (ggml_cuda_frt_flint_try(*cuda_ctx, cgraph, i, &frt_skip)) {
++            return frt_skip - 1;   // caller advances by (return + 1)
++        }
++    }
++#endif
++
+     ggml_tensor * node = cgraph->nodes[i];
+ 
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+@@ -4803,11 +4816,19 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+ }
+ #endif // USE_CUDA_GRAPH
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph);
++#endif
++
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++#ifdef GGML_CUDA_FLASHRT_SM120
++    ggml_cuda_frt_prepare(*cuda_ctx, cgraph);   // eager-only setup, before any capture can begin
++#endif
++
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;
+-- 
+2.43.0
+

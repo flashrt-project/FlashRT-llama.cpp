@@ -11,7 +11,7 @@ a FlashRT runtime.
 | `fr_*.cu`, `fr_kernels.h`, `fr_ggml.cuh` | the adapter: framework-free kernels behind C entry points, and the ggml-facing windows |
 | `vendor/csrc/` | FlashRT kernel sources, vendored one-way from [FlashRT](https://github.com/flashrt-project/FlashRT) (`vendor/FLASHRT_VENDOR.txt` pins the commit; `vendor/sync.sh` refreshes; kernels are never edited here) |
 | `third_party/cutlass` | submodule |
-| `hosts/` | per-host pin, patch series and build instructions: upstream llama.cpp (RTX 5090) and Jetson-PI-Edge (Jetson AGX Thor) |
+| `hosts/` | per-host pin, patch series and build instructions: upstream llama.cpp (RTX 5090), llama.cpp with Flint (RTX 5090) and Jetson-PI-Edge (Jetson AGX Thor) |
 | `qualification/`, `tools/` | release gates and the binding-header generator; they read the structure catalog from the installed `flash-rt` package |
 
 Documentation: [USAGE.md](USAGE.md) · [TESTING.md](TESTING.md) · [DEVELOPMENT.md](DEVELOPMENT.md).
@@ -19,8 +19,10 @@ Documentation: [USAGE.md](USAGE.md) · [TESTING.md](TESTING.md) · [DEVELOPMENT.
 Measured: pi0.5 on Jetson AGX Thor **202.7 → 35.5 ms** (5.7×, 2 views,
 `llama_encode` + `llama_decode` P50 warm); Qwen3.6-35B-A3B on RTX 5090
 **283 → 368 tok/s** decode on a stock Q4_K_M GGUF, 433–444 with
-speculative decoding. Receipts and protocol in TESTING.md and the
-hosts' READMEs.
+speculative decoding; Recursive Flint on RTX 5090 (official NVFP4 GGUF,
+bit-identical to stock) **242 → 550 tok/s** decode at empty context and
+152 → 265 at 100K, 8K-token prefill 7.2K → 16.5K tok/s. Receipts and
+protocol in TESTING.md and the hosts' READMEs.
 
 ## What it is
 

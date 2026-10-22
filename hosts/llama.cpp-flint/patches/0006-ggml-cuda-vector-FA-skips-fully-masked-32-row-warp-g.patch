@@ -1,0 +1,51 @@
+From c9d32d565777531b0eef1967c36a267d963b2db9 Mon Sep 17 00:00:00 2001
+From: LiangSu8899 <7thuniversels@gmail.com>
+Date: Wed, 21 Oct 2026 20:34:47 -0400
+Subject: [PATCH 6/7] ggml-cuda: vector FA skips fully masked 32-row warp
+ groups
+
+A warp whose rows are masked for every column leaves its running max,
+denominator and accumulator unchanged (scale 1, zero contributions, the
+accumulator is never -0), so skipping the group is bit-identical. With a
+sliding-window cache sized window + n_ubatch, decode attention no longer
+scans the masked part of the ring: decode speed is independent of n_ubatch.
+Build with GGML_CUDA_FA_VEC_NO_MASKED_SKIP to disable.
+Decode logits bit-identical to stock (1024 positions; 4096 positions with a
+4096-ubatch context); tg128 +3% at 0/4K/16K depth.
+
+---
+ ggml/src/ggml-cuda/fattn-vec.cuh | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 74f2820..cb55a58 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -255,6 +255,24 @@ static __global__ void flash_attn_ext_vec(
+              // Increment pointers after each loop:
+              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+ 
++#ifndef GGML_CUDA_FA_VEC_NO_MASKED_SKIP
++        // A warp whose 32 rows are fully masked for every column would leave its state unchanged
++        // (max unchanged, scale 1, zero contributions): skipping it is bit-identical. Sliding-window
++        // caches are mostly masked, so decode cost no longer grows with the ring size.
++        if (mask) {
++            bool masked = true;
++#pragma unroll
++            for (int j = 0; j < ncols; ++j) {
++                if (ncols == 1 || ic0 + j < int(ne01.z)) {
++                    masked = masked && __half2float(maskh[j*ne11 + threadIdx.y*WARP_SIZE + threadIdx.x]) == -INFINITY;
++                }
++            }
++            if (__all_sync(0xFFFFFFFF, masked)) {
++                continue;
++            }
++        }
++#endif // GGML_CUDA_FA_VEC_NO_MASKED_SKIP
++
+         // Calculate KQ tile and keep track of new maximum KQ values:
+         float KQ_reg[ncols]; // KQ in registers.
+ 
+-- 
+2.43.0
+

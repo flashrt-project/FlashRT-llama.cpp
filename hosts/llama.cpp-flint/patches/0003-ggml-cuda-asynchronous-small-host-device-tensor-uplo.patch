@@ -1,0 +1,139 @@
+From b400700cd22b43c16a637dd6d79daa0d6bc3410e Mon Sep 17 00:00:00 2001
+From: LiangSu8899 <7thuniversels@gmail.com>
+Date: Wed, 21 Oct 2026 19:22:51 -0400
+Subject: [PATCH 3/7] ggml-cuda: asynchronous small host->device tensor uploads
+
+set_tensor of <= 64 KiB no longer blocks: the copy is issued on the
+per-thread stream and an event is recorded; graph compute, the backend
+async copies and get_tensor wait on that event. A pageable source is staged
+when cudaMemcpyAsync returns, so callers may reuse it. Per-token graph
+inputs (token, positions, masks, cache indices) were 14 blocking round trips
+per decode step. GGML_CUDA_SYNC_UPLOADS=1 restores the blocking behaviour.
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 48 +++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 8c7f44e..4f2dcc0 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -840,11 +840,51 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 
++// Small host -> device uploads (per-token graph inputs) are asynchronous: a
++// pageable source is staged when cudaMemcpyAsync returns, so the caller may
++// reuse it, and every later device-side reader waits on the upload event
++// instead of the host blocking once per tensor. GGML_CUDA_SYNC_UPLOADS=1
++// restores the blocking behaviour.
++struct ggml_cuda_upload_state {
++    cudaEvent_t event   = nullptr;
++    bool        pending = false;
++};
++static ggml_cuda_upload_state ggml_cuda_uploads[GGML_CUDA_MAX_DEVICES];
++static constexpr size_t GGML_CUDA_ASYNC_UPLOAD_MAX = 64*1024;
++
++static bool ggml_cuda_async_uploads_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("GGML_CUDA_SYNC_UPLOADS");
++        return !(env && atoi(env) != 0);
++    }();
++    return enabled;
++}
++
++// make `stream` wait for pending async uploads to `device`
++static void ggml_cuda_uploads_wait(int device, cudaStream_t stream) {
++    ggml_cuda_upload_state & u = ggml_cuda_uploads[device];
++    if (u.pending) {
++        CUDA_CHECK(cudaStreamWaitEvent(stream, u.event, 0));
++        if (stream != cudaStreamPerThread) {
++            u.pending = false;
++        }
++    }
++}
++
+ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
++    if (size <= GGML_CUDA_ASYNC_UPLOAD_MAX && ggml_cuda_async_uploads_enabled()) {
++        ggml_cuda_upload_state & u = ggml_cuda_uploads[ctx->device];
++        if (u.event == nullptr) {
++            CUDA_CHECK(cudaEventCreateWithFlags(&u.event, cudaEventDisableTiming));
++        }
++        CUDA_CHECK(cudaEventRecord(u.event, cudaStreamPerThread));
++        u.pending = true;
++        return;
++    }
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 
+@@ -852,6 +892,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_uploads_wait(ctx->device, cudaStreamPerThread);
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+@@ -884,6 +925,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+         // in which case a same-device copy (not a peer copy) is required
+         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
++        ggml_cuda_uploads_wait(src_ctx->device, cudaStreamPerThread);
+         if (src_physical == dst_physical) {
+             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+         } else {
+@@ -2605,6 +2647,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
++    ggml_cuda_uploads_wait(cuda_ctx->device, cuda_ctx->stream());
+ 
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+@@ -2614,6 +2657,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
++    ggml_cuda_uploads_wait(cuda_ctx->device, cuda_ctx->stream());
+ 
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+@@ -2624,6 +2668,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
++    ggml_cuda_uploads_wait(cuda_ctx->device, cuda_ctx->stream());
+ 
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+@@ -2635,6 +2680,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
++    ggml_cuda_uploads_wait(cuda_ctx->device, cuda_ctx->stream());
+ 
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+@@ -2655,6 +2701,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+     // device -> device copy
+     ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
+     ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
++    ggml_cuda_uploads_wait(cuda_ctx_src->device, cuda_ctx_src->stream());
+ 
+     ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
+     ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+@@ -4824,6 +4871,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_uploads_wait(cuda_ctx->device, cuda_ctx->stream());   // before any capture can begin
+ 
+ #ifdef GGML_CUDA_FLASHRT_SM120
+     ggml_cuda_frt_prepare(*cuda_ctx, cgraph);   // eager-only setup, before any capture can begin
+-- 
+2.43.0
+

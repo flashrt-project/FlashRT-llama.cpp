@@ -137,3 +137,58 @@ scores measurably better than an online Q6_K-sourced rebuild — keep
 fallback only. Diagnostics: `FRT_STATS=1`, `FRT_MOEFUSE_DBG=<n>`,
 `FRT_MOEFUSE_SELFTEST=1`, `FRT_DUMP_GRAPH=1` + `FRT_DUMP_M=<m>`
 (+ `FRT_DUMP_PATH`).
+
+## SM120 / Flint NVFP4 target
+
+Recursive Flint (49 layers, sliding-window + full attention, sigmoid
+top-6/256 MoE with an ungated shared expert) on the official NVFP4 GGUF.
+The host is llama.cpp with the Flint model (upstream PR #30928, pinned in
+`hosts/llama.cpp-flint/PIN`); `hosts/llama.cpp-flint/build.sh` clones it,
+applies the patch series and builds with `-DGGML_CUDA_FLASHRT_SM120=ON`.
+The window file is `fr_win_flint_sm120.cu`; it is compiled inside the
+ggml-cuda target with ggml's own flags.
+
+Recommended serving flags (official Flint flags plus the ubatch):
+
+```bash
+llama-server -m flint-nvfp4.gguf -ngl 99 -c <ctx> -np 1 -fa on -ctk f16 -ctv f16 --jinja \
+  --temp 1 --top-p 0.95 --top-k 20 --min-p 0 -b 4096 -ub 4096
+```
+
+`-ub 4096` (default 512) roughly doubles prompt throughput for this MoE;
+decode speed does not depend on it with this host (patch 0006). `-ub 8192`
+is slower.
+
+Numerics. The default path is exact: decode and prefill logits are
+bit-identical to stock llama.cpp at the same `-ub` (the windows reproduce
+ggml's per-element arithmetic order; see TESTING.md). The only
+non-bitwise component is the opt-in decode attention `FRT_ATTNDEC=1`
+(tensor-core GQA attention with f32-level operands, per-call relative
+error vs ggml ~1e-6), gated by perplexity/KLD against stock's own
+prefill-vs-decode variation.
+
+| variable | effect |
+|---|---|
+| `GGML_CUDA_FLASHRT_DISABLE=1` | whole layer off (stock kernels) |
+| `GGML_FLASHRT_NO_{AMAX,ATTNQKV,ROUTE,OPROJ,MOEFFN,DENSEFFN,LMHEAD,MOETAILPF,GUGLUPF}=1` | disable one window (decode: AMAX, ATTNQKV, ROUTE, OPROJ, MOEFFN, DENSEFFN, LMHEAD; prefill: AMAX, MOETAILPF, GUGLUPF) |
+| `FRT_ATTNDEC=1` | opt-in decode attention (non-bitwise, see above); `FRT_ATTNDEC_QKN=0` keeps the separate head-norm kernel, `FRT_ATTNDEC_MAX_TILES=<n>` (default 1280 = ~80K rows) hands longer caches back to ggml |
+| `FRT_NW_{QKV,OPROJ,GU,DOWN,ROUTE,DGU,DDOWN,LMHEAD}=4\|8\|16` | warps per CTA of the GEMV windows (defaults from a shape search) |
+| `FRT_ATTNDEC_CHECK=<k>` | test aid: every k-th ATTNDEC call is compared against ggml's kernel (eager mode only, `GGML_CUDA_DISABLE_GRAPHS=1`) |
+| `FRT_PF_CHECK=1` | test aid: the prefill MoE tail window compares against ggml's own execution (eager mode) |
+| `FRT_STATS=1`, `FRT_DUMP_GRAPH=1` + `FRT_DUMP_M=<m>` (+ `FRT_DUMP_PATH`) | diagnostics |
+
+Host-side switches added by the Flint patch series (all default on,
+identical results either way):
+
+| variable | effect |
+|---|---|
+| `GGML_CUDA_SYNC_UPLOADS=1` | blocking small host-to-device uploads (stock behaviour) |
+| `GGML_CUDA_MMID_SINGLE_WARP=1` | single-warp MoE id helper (stock) |
+| `GGML_CUDA_FA_KV_MIN=0` | no masked-tile skipping in the tensor-core FA kernel |
+| `LLAMA_KQ_MASK_SERIAL=1` | serial KQ-mask fill |
+| build with `GGML_CUDA_FA_VEC_NO_MASKED_SKIP` | no masked-warp skipping in the vector FA kernel |
+
+`--backend-sampling` (stock option) speeds up decode by ~6% but, in this
+llama.cpp version, re-reserves the scheduler for every request
+(`llama_set_sampler`), which adds ~0.1 s to each request's time to first
+token at `-ub 4096`; it is not part of the recommended flags.
