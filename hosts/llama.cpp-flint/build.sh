@@ -31,5 +31,5 @@ ln -s "$overlay" ggml/src/ggml-cuda/flashrt
 
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
       -DGGML_CUDA_FLASHRT_SM120=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target llama-server llama-bench llama-cli llama-perplexity -j "$jobs"
+cmake --build build --target llama-server llama-bench llama-cli llama-perplexity llama-batched-bench -j "$jobs"
 echo "built: $work/build/bin"
