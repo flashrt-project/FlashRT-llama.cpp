@@ -518,7 +518,7 @@ static bool frt_attndec_eligible(const ggml_cgraph * cgraph, int i);
 // Q or K head: normalized (+ roped) values out[k] for elements oix[k] of the head.
 template <bool rope>
 static __device__ __forceinline__ void frt_qkn_vals(const float * xc, const float * mulc, const int lane,
-        const frt_qkn_params & p, float (&out)[4], int (&oix)[4]) {
+        const frt_qkn_params & p, float (&out)[4], int (&oix)[4], const int pos = 0) {
     if constexpr (!rope) {
         const float4 * x4 = (const float4 *) xc;
         float4 xs[1];
@@ -563,7 +563,7 @@ static __device__ __forceinline__ void frt_qkn_vals(const float * xc, const floa
             const int ix1 = i0 / 2 + p.rp.n_dims / 2;
             const float x0 = scale * __ldcg(xc + ix0) * mulc[ix0];
             const float x1 = scale * __ldcg(xc + ix1) * mulc[ix1];
-            const float theta_base  = p.pos[0]*powf(p.rp.theta_scale, i0/2.0f);
+            const float theta_base  = pos*powf(p.rp.theta_scale, i0/2.0f);
             const float freq_factor = 1.0f;
             float cos_theta;
             float sin_theta;
@@ -590,13 +590,14 @@ static __device__ __forceinline__ void frt_qkn_vals(const float * xc, const floa
 }
 
 template <bool rope>
-static __device__ __forceinline__ void frt_qkn_head(const float * qkv, const int h, const int lane, const frt_qkn_params & p) {
+static __device__ __forceinline__ void frt_qkn_head(const float * qkv, const int h, const int lane, const frt_qkn_params & p,
+        const int pos, const int64_t kidx, const int64_t vidx, float * q_out) {
     constexpr int D = 128;
     const bool is_v = h >= p.hq + p.hk;
     const bool is_k = !is_v && h >= p.hq;
     const float * xc = qkv + (size_t) h * D;   // written by other CTAs of this or the previous kernel
     if (is_v) {   // set_rows f32 -> f16 of the scaled V head
-        half * dst = (half *) ((char *) p.v_cache + (size_t) p.v_idx[0] * p.v_row_bytes) + (size_t) (h - p.hq - p.hk) * D;
+        half * dst = (half *) ((char *) p.v_cache + (size_t) vidx * p.v_row_bytes) + (size_t) (h - p.hq - p.hk) * D;
 #pragma unroll
         for (int k = 0; k < D / WARP_SIZE; ++k) {
             dst[lane + k * WARP_SIZE] = __float2half(__ldcg(xc + lane + k * WARP_SIZE));
@@ -605,13 +606,13 @@ static __device__ __forceinline__ void frt_qkn_head(const float * qkv, const int
     }
     float out[4];
     int   oix[4];
-    frt_qkn_vals<rope>(xc, is_k ? p.kn_w : p.qn_w, lane, p, out, oix);
+    frt_qkn_vals<rope>(xc, is_k ? p.kn_w : p.qn_w, lane, p, out, oix, pos);
     if (is_k) {
-        half * dst = (half *) ((char *) p.k_cache + (size_t) p.k_idx[0] * p.k_row_bytes) + (size_t) (h - p.hq) * D;
+        half * dst = (half *) ((char *) p.k_cache + (size_t) kidx * p.k_row_bytes) + (size_t) (h - p.hq) * D;
 #pragma unroll
         for (int k = 0; k < 4; ++k) dst[oix[k]] = __float2half(out[k]);
     } else {
-        float * dst = p.q_out + (size_t) h * D;
+        float * dst = q_out + (size_t) h * D;
 #pragma unroll
         for (int k = 0; k < 4; ++k) dst[oix[k]] = out[k];
     }
@@ -672,7 +673,7 @@ static __global__ void frt_attn_qkn(const float * qkv, const frt_qkn_params p) {
         return;
     }
     ggml_cuda_pdl_sync();
-    frt_qkn_head<rope>(qkv, h, lane, p);
+    frt_qkn_head<rope>(qkv, h, lane, p, p.pos ? p.pos[0] : 0, p.k_idx[0], p.v_idx[0], p.q_out);
 }
 
 static float * g_qkv = nullptr;
@@ -700,6 +701,8 @@ static bool frt_rope_params_of(const ggml_tensor * rope, frt_rope_params & rp) {
     return true;
 }
 
+#include "fr_win_flint_batched.cuh"
+
 // anchor: RMS_NORM over the residual stream followed by MUL(attn_norm.weight).
 static bool frt_attnqkv_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
     static const bool on = frt_window_on("GGML_FLASHRT_NO_ATTNQKV");
@@ -709,7 +712,9 @@ static bool frt_attnqkv_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     const ggml_tensor * an = cgraph->nodes[i + 1];
     if (an->op != GGML_OP_MUL || an->src[0] != rn || !strstr(an->src[1]->name, ".attn_norm.weight")) return false;
     const ggml_tensor * x = rn->src[0];
-    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || ggml_nrows(x) != 1 || !ggml_is_contiguous(x)) return false;
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(x)) return false;
+    const int T = (int) ggml_nrows(x);   // tokens of the ubatch: 1 = decode windows, 2..FRT_B_TMAX = batched windows
+    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
     const ggml_tensor * nw = an->src[1];
     if (nw->type != GGML_TYPE_F32 || nw->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(nw)) return false;
     if (!frt_aligned16(x->data) || !frt_aligned16(nw->data)) return false;
@@ -781,20 +786,20 @@ static bool frt_attnqkv_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
         frt_rope_params rk;
         if (!frt_rope_params_of(q.rope, rp) || !frt_rope_params_of(k.rope, rk)) return false;
         if (memcmp(&rp, &rk, sizeof(rp)) != 0 || q.rope->src[1] != k.rope->src[1]) return false;
-        if (q.rope->src[1]->type != GGML_TYPE_I32 || q.rope->src[1]->ne[0] != 1) return false;
+        if (q.rope->src[1]->type != GGML_TYPE_I32 || ggml_nelements(q.rope->src[1]) != T) return false;
         pos = (const int32_t *) q.rope->src[1]->data;
     }
     const ggml_tensor * qfin = q.last();
     const ggml_tensor * kfin = k.last();
-    if (qfin->type != GGML_TYPE_F32 || !ggml_is_contiguous(qfin) || qfin->ne[0] != 128 || qfin->ne[1] * 128 != nq) return false;
+    if (qfin->type != GGML_TYPE_F32 || !ggml_is_contiguous(qfin) || qfin->ne[0] != 128 || qfin->ne[1] * 128 != nq || qfin->ne[2] != T) return false;
     // cache writes: SET_ROWS(VIEW(head block of this token), idx) into f16 rows of nk elements
     auto set_ok = [&](const ggml_tensor * s, const ggml_tensor * src) {
         const ggml_tensor * v = s->src[0];
-        if (v->op != GGML_OP_VIEW || v->view_offs != 0 || v->ne[0] != nk || ggml_nrows(v) != 1) return false;
+        if (v->op != GGML_OP_VIEW || v->view_offs != 0 || v->ne[0] != nk || ggml_nrows(v) != T || (T > 1 && (size_t) v->nb[1] != (size_t) nk * sizeof(float))) return false;
         const ggml_tensor * vs = v->src[0];
         if (!(vs == src || (vs->op == GGML_OP_RESHAPE && vs->src[0] == src))) return false;
         return s->type == GGML_TYPE_F16 && s->ne[0] == nk && s->nb[0] == sizeof(half) &&
-               s->src[1]->type == GGML_TYPE_I64 && ggml_nelements(s->src[1]) == 1;
+               s->src[1]->type == GGML_TYPE_I64 && ggml_nelements(s->src[1]) == T;
     };
     if (!set_ok(k_set, kfin) || !set_ok(v_set, vmul)) return false;
     // everything inside the span except Q's final tensor and the two cache writes is internal
@@ -808,6 +813,31 @@ static bool frt_attnqkv_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
         (float *) qfin->data, (half *) k_set->data, (half *) v_set->data,
         (const int64_t *) k_set->src[1]->data, (const int64_t *) v_set->src[1]->data,
         (size_t) k_set->nb[1], (size_t) v_set->nb[1], hq, hk, pos, rp, 128 };
+    if (T > 1) {   // batched: norm + q8 of T rows, one multi-token GEMV over Q | K | V, per-(token, head) epilogue
+        ggml_cuda_kernel_launch(frt_b_norm_q8<16>, ggml_cuda_kernel_launch_params((dim3) T, (dim3) 512, 0, stream),
+            (const float *) x->data, (int64_t) FRT_K_EMBD, (const float *) nw->data, eps, (float *) nullptr, (int64_t) 0, g_b_q8, FRT_K_EMBD);
+        frt_b_gemv_args a = frt_b_args1(g_b_q8, (const char *) wq->data, (const float *) sq->data, (size_t) wq->nb[1], g_b_qkv, nrows, nrows, T);
+        a.n_seg = 3;
+        a.seg_end[0] = nq; a.seg_end[1] = nq + nk; a.seg_end[2] = nrows;
+        a.w[1] = (const char *) wk->data; a.s[1] = (const float *) sk->data;
+        a.w[2] = (const char *) wv->data; a.s[2] = (const float *) sv->data;
+        frt_b_gemv_launch<FRT_K_EMBD / 64, FRT_B_EPI_SCALE>(a, stream);
+        constexpr int HW = 4;
+        float * chk = frt_b_check_begin(qfin, end, "attnqkv");
+        frt_qkn_params qpb = qp;
+        if (chk) qpb.q_out = chk;
+        const ggml_cuda_kernel_launch_params lp2((dim3) ((T * nh + HW - 1) / HW), (dim3) (HW * WARP_SIZE), 0, stream);
+        ggml_cuda_kernel_launch(rope ? frt_b_attn_qkn<true> : frt_b_attn_qkn<false>, lp2, (const float *) g_b_qkv, (int64_t) nrows, qpb, T);
+        if (frt_stats_on()) {
+            static long fires = 0;
+            if ((++fires & 0xFFF) == 1) fprintf(stderr, "frt-stats attnqkv-batched fires=%ld T=%d span=%d rope=%d\n", fires, T, end - i + 1, (int) rope);
+        }
+        if (chk) return false;
+        if (frt_h_check_on()) frt_h_check_qkv(stream, (const float *) x->data, (const float *) nw->data, eps, T, (const char *) wq->data, (const char *) wk->data,
+            (const char *) wv->data, (size_t) wq->nb[1], (const float *) sq->data, (const float *) sk->data, (const float *) sv->data, nq, nk);
+        *skip_count = end - i + 1;
+        return true;
+    }
     FRT_NW_DISPATCH32(nw_qkv,
         ggml_cuda_kernel_launch(frt_attn_qkv<NWT>, ggml_cuda_kernel_launch_params((dim3) ((nrows + NWT - 1) / NWT), (dim3) (NWT * WARP_SIZE), 0, stream),
             (const float *) x->data, (const float *) nw->data, eps,
@@ -896,13 +926,18 @@ static bool frt_oproj_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
     if (mm->op != GGML_OP_MUL_MAT || !strstr(mm->src[0]->name, ".attn_output.weight")) return false;
     const ggml_tensor * w = mm->src[0], * a = mm->src[1];
     if (w->type != GGML_TYPE_NVFP4 || w->ne[0] != 4096 || !ggml_is_contiguous(w)) return false;
-    if (a->type != GGML_TYPE_F32 || a->ne[0] != 4096 || ggml_nrows(a) != 1 || !ggml_is_contiguous(a)) return false;
+    if (a->type != GGML_TYPE_F32 || a->ne[0] != 4096 || !ggml_is_contiguous(a)) return false;
+    const int T = (int) ggml_nrows(a);
+    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
     const ggml_tensor * smul = cgraph->nodes[i + 1];
     const ggml_tensor * s = frt_mm_scale_src(smul, mm);
     if (!s) return false;
     // last layer: GET_ROWS(proj, out_ids) and GET_ROWS(residual, out_ids) feed the add.
-    // With one token both select row 0 of a 1-row tensor, i.e. plain copies.
+    // With one token both select row 0 of a 1-row tensor, i.e. plain copies; with T
+    // tokens the batched kernel gathers the T_out selected rows.
     int nsp = 3;
+    int T_out = T;
+    const ggml_tensor * out_ids = nullptr;
     ggml_tensor * add = cgraph->nodes[i + 2];
     const ggml_tensor * resid = nullptr;
     if (add->op == GGML_OP_GET_ROWS) {
@@ -912,21 +947,42 @@ static bool frt_oproj_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
         if (g0->src[0] != smul || g1->op != GGML_OP_GET_ROWS || g0->src[1] != g1->src[1] || add->op != GGML_OP_ADD ||
             add->src[0] != g0 || add->src[1] != g1) return false;
         const ggml_tensor * ids = g0->src[1];
-        if (ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 || g0->type != GGML_TYPE_F32 || g1->type != GGML_TYPE_F32 ||
-            ggml_nrows(g1->src[0]) != 1 || g1->src[0]->type != GGML_TYPE_F32 || ggml_nrows(g0) != 1 || ggml_nrows(g1) != 1) return false;
+        if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || g0->type != GGML_TYPE_F32 || g1->type != GGML_TYPE_F32 ||
+            ggml_nrows(g1->src[0]) != T || g1->src[0]->type != GGML_TYPE_F32) return false;
+        T_out = (int) ggml_nelements(ids);
+        if (T_out < 1 || T_out > FRT_B_TMAX || ggml_nrows(g0) != T_out || ggml_nrows(g1) != T_out) return false;
+        if (T == 1 && T_out != 1) return false;
         if (!frt_node_ok(cgraph, i + 2, GGML_OP_GET_ROWS, 1) || !frt_node_ok(cgraph, i + 3, GGML_OP_GET_ROWS, 1)) return false;
         resid = g1->src[0];
+        out_ids = T > 1 ? ids : nullptr;
         nsp = 5;
     } else {
         if (add->op != GGML_OP_ADD || add->src[0] != smul) return false;
         resid = add->src[1];
     }
     const int n_out = (int) w->ne[1];
-    if (resid->type != GGML_TYPE_F32 || !ggml_is_contiguous(resid) || resid->ne[0] != n_out || ggml_nrows(resid) != 1) return false;
-    if (add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || add->ne[0] != n_out || ggml_nrows(add) != 1) return false;
+    if (resid->type != GGML_TYPE_F32 || !ggml_is_contiguous(resid) || resid->ne[0] != n_out || ggml_nrows(resid) != T) return false;
+    if (add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || add->ne[0] != n_out || ggml_nrows(add) != T_out) return false;
     if (!frt_node_ok(cgraph, i, GGML_OP_MUL_MAT, 1) || !frt_node_ok(cgraph, i + 1, GGML_OP_MUL, 1) || !frt_node_ok(cgraph, i + nsp - 1, GGML_OP_ADD, 0)) return false;
     // every CTA reads all of `a`; thread r reads resid[r] before writing out[r]
     if (frt_overlap(add, a) || (add->data != resid->data && frt_overlap(add, resid))) return false;
+    if (T > 1) {
+        if (out_ids && frt_overlap(add, resid)) return false;   // gathered rows: no in-place
+        cudaStream_t stream = ctx.stream();
+        ggml_cuda_kernel_launch(frt_b_q8<8>, ggml_cuda_kernel_launch_params((dim3) T, (dim3) 256, 0, stream),
+            (const float *) a->data, (int64_t) 4096, g_b_q8o, 4096);
+        float * chk = frt_b_check_begin(add, i + nsp - 1, "oproj");
+        frt_b_gemv_args ga = frt_b_args1(g_b_q8o, (const char *) w->data, (const float *) s->data, (size_t) w->nb[1], chk ? chk : (float *) add->data, n_out, n_out, T_out);
+        ga.tok_map = out_ids ? (const int32_t *) out_ids->data : nullptr;
+        ga.resid = (const float *) resid->data;
+        ga.ld_resid = n_out;
+        frt_b_gemv_launch<4096 / 64, FRT_B_EPI_RESID>(ga, stream);
+        if (chk) return false;
+        if (frt_h_check_on()) frt_h_check_oproj(stream, (const float *) a->data, T, T_out, ga.tok_map, (const char *) w->data, (size_t) w->nb[1],
+            (const float *) s->data, (const float *) resid->data, (const float *) add->data, n_out);
+        *skip_count = nsp;
+        return true;
+    }
     static const int nw_op = frt_cfg_nw("FRT_NW_OPROJ", 16);   // tile search: 16 > 8 > 4
     FRT_NW_DISPATCH(nw_op,
         ggml_cuda_kernel_launch(frt_oproj<NWT>, ggml_cuda_kernel_launch_params((dim3) ((n_out + NWT - 1) / NWT), (dim3) (NWT * WARP_SIZE), 0, ctx.stream()),
@@ -1065,21 +1121,44 @@ static bool frt_denseffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     if (!ds || add->op != GGML_OP_ADD || add->src[0] != dsm) return false;
     const ggml_tensor * x = rn->src[0], * nw = nm->src[1], * resid = add->src[1];
     const ggml_tensor * gw = gm->src[0], * uw = um->src[0], * dw = dm->src[0];
-    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || ggml_nrows(x) != 1 || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
+    const int T = (int) ggml_nrows(x);
+    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
     if (nw->type != GGML_TYPE_F32 || nw->ne[0] != FRT_K_EMBD || ggml_nrows(nw) != 1 || !ggml_is_contiguous(nw) || !frt_aligned16(nw->data)) return false;
-    if (nm->ne[0] != FRT_K_EMBD || ggml_nrows(nm) != 1) return false;
+    if (nm->ne[0] != FRT_K_EMBD || ggml_nrows(nm) != T) return false;
     for (const ggml_tensor * w : { gw, uw }) {
         if (w->type != GGML_TYPE_NVFP4 || w->ne[0] != FRT_K_EMBD || w->ne[1] != FRT_DFF || !ggml_is_contiguous(w) || w->nb[1] != gw->nb[1]) return false;
     }
     if (dw->type != GGML_TYPE_NVFP4 || dw->ne[0] != FRT_DFF || dw->ne[1] != FRT_K_EMBD || !ggml_is_contiguous(dw)) return false;
-    if (resid->type != GGML_TYPE_F32 || resid->ne[0] != FRT_K_EMBD || ggml_nrows(resid) != 1 || !ggml_is_contiguous(resid)) return false;
-    if (add->type != GGML_TYPE_F32 || add->ne[0] != FRT_K_EMBD || ggml_nrows(add) != 1 || !ggml_is_contiguous(add)) return false;
+    if (resid->type != GGML_TYPE_F32 || resid->ne[0] != FRT_K_EMBD || ggml_nrows(resid) != T || !ggml_is_contiguous(resid)) return false;
+    if (add->type != GGML_TYPE_F32 || add->ne[0] != FRT_K_EMBD || ggml_nrows(add) != T || !ggml_is_contiguous(add)) return false;
     // K2 thread r reads resid[r] before writing out[r]: an exact alias is safe, a partial one is not
     if (add->data != resid->data && frt_overlap(add, resid)) return false;
     if (!frt_span_closed(cgraph, i, i + 9, {})) return false;
     float eps;
     memcpy(&eps, rn->op_params, sizeof(float));
     cudaStream_t stream = ctx.stream();
+    if (T > 1) {
+        ggml_cuda_kernel_launch(frt_b_norm_q8<16>, ggml_cuda_kernel_launch_params((dim3) T, (dim3) 512, 0, stream),
+            (const float *) x->data, (int64_t) FRT_K_EMBD, (const float *) nw->data, eps, (float *) nullptr, (int64_t) 0, g_b_q8, FRT_K_EMBD);
+        frt_b_gemv_args g1 = frt_b_args1(g_b_q8, (const char *) gw->data, (const float *) gs->data, (size_t) gw->nb[1], g_b_glu, FRT_DFF, FRT_DFF, T);
+        g1.w2 = (const char *) uw->data;
+        g1.s2 = (const float *) us->data;
+        frt_b_gemv_launch<FRT_K_EMBD / 64, FRT_B_EPI_GLU>(g1, stream);
+        ggml_cuda_kernel_launch(frt_b_q8<8>, ggml_cuda_kernel_launch_params((dim3) T, (dim3) 256, 0, stream),
+            (const float *) g_b_glu, (int64_t) FRT_DFF, g_b_q8d, FRT_DFF);
+        float * chk = frt_b_check_begin(add, i + 9, "denseffn");
+        frt_b_gemv_args g2 = frt_b_args1(g_b_q8d, (const char *) dw->data, (const float *) ds->data, (size_t) dw->nb[1], chk ? chk : (float *) add->data, FRT_K_EMBD, FRT_K_EMBD, T);
+        g2.resid = (const float *) resid->data;
+        g2.ld_resid = FRT_K_EMBD;
+        frt_b_gemv_launch<FRT_DFF / 64, FRT_B_EPI_RESID>(g2, stream);
+        if (chk) return false;
+        if (frt_h_check_on()) frt_h_check_dense(stream, (const float *) x->data, (const float *) nw->data, eps, T, (const char *) gw->data, (const char *) uw->data,
+            (const char *) dw->data, (size_t) gw->nb[1], (size_t) dw->nb[1], (const float *) gs->data, (const float *) us->data, (const float *) ds->data,
+            (const float *) resid->data, (const float *) add->data);
+        *skip_count = 10;
+        return true;
+    }
     static const int nw_gu = frt_cfg_nw("FRT_NW_DGU", 16);
     static const int nw_dn = frt_cfg_nw("FRT_NW_DDOWN", 16);
     FRT_NW_DISPATCH(nw_gu,
@@ -1163,17 +1242,33 @@ static bool frt_lmhead_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     const ggml_tensor * s = frt_mm_scale_src(smul, mm);
     if (!s) return false;
     const ggml_tensor * x = rn->src[0], * nw = nm->src[1], * w = mm->src[0];
-    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || ggml_nrows(x) != 1 || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
+    const int T = (int) ggml_nrows(x);
+    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
     if (nw->type != GGML_TYPE_F32 || ggml_nelements(nw) != FRT_K_EMBD || !ggml_is_contiguous(nw) || !frt_aligned16(nw->data)) return false;
-    if (nm->type != GGML_TYPE_F32 || ggml_nrows(nm) != 1 || !ggml_is_contiguous(nm) || !frt_aligned16(nm->data)) return false;
+    if (nm->type != GGML_TYPE_F32 || ggml_nrows(nm) != T || !ggml_is_contiguous(nm) || !frt_aligned16(nm->data)) return false;
     if (w->type != GGML_TYPE_NVFP4 || w->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(w)) return false;
-    if (smul->type != GGML_TYPE_F32 || ggml_nrows(smul) != 1 || !ggml_is_contiguous(smul) || smul->ne[0] != w->ne[1]) return false;
+    if (smul->type != GGML_TYPE_F32 || ggml_nrows(smul) != T || !ggml_is_contiguous(smul) || smul->ne[0] != w->ne[1]) return false;
     // the normalized row is a graph output (kept), the raw norm and the unscaled product are internal
     if (!frt_span_closed(cgraph, i, i + 3, { nm })) return false;
     // nm may alias x: the single norm CTA reads all of x (into registers) before its first store
     float eps;
     memcpy(&eps, rn->op_params, sizeof(float));
     cudaStream_t stream = ctx.stream();
+    if (T > 1) {
+        if (nm->data != x->data && frt_overlap(nm, x)) return false;   // row t of nm is written after row t of x is read
+        ggml_cuda_kernel_launch(frt_b_norm_q8<16>, ggml_cuda_kernel_launch_params((dim3) T, (dim3) 512, 0, stream),
+            (const float *) x->data, (int64_t) FRT_K_EMBD, (const float *) nw->data, eps, (float *) nm->data, (int64_t) FRT_K_EMBD, g_b_q8, FRT_K_EMBD);
+        const int n_rows = (int) w->ne[1];
+        float * chk = frt_b_check_begin(smul, i + 3, "lmhead");
+        frt_b_gemv_args a = frt_b_args1(g_b_q8, (const char *) w->data, (const float *) s->data, (size_t) w->nb[1], chk ? chk : (float *) smul->data, n_rows, n_rows, T);
+        frt_b_gemv_launch<FRT_K_EMBD / 64, FRT_B_EPI_SCALE>(a, stream);
+        if (chk) return false;
+        if (frt_h_check_on()) frt_h_check_lmhead(stream, (const float *) nm->data, T, (const char *) w->data, (size_t) w->nb[1],
+            (const float *) s->data, (const float *) smul->data, n_rows);
+        *skip_count = 4;
+        return true;
+    }
     ggml_cuda_kernel_launch(frt_lm_norm, ggml_cuda_kernel_launch_params((dim3) 1, (dim3) 512, 0, stream),
         (const float *) x->data, (const float *) nw->data, eps, (float *) nm->data, g_lm_q8);
     const int n_rows = (int) w->ne[1];
@@ -1604,6 +1699,10 @@ static __device__ __forceinline__ void frt_topk256_warp(const float * logits, co
     }
 }
 
+struct frt_moe_chain { float s1, b1, s2, b2, cmin, cmax, s3, b3; };
+
+#include "fr_win_flint_batched_moe.cuh"
+
 template <int NW>   // NW * 32 = 256 x (router rows per CTA)
 static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_route(
         const float * x, const float * norm_w, const float eps, const int ncols, float * xn_out,
@@ -1683,7 +1782,7 @@ struct frt_route_m {
     const ggml_tensor * x, * nw, * wr;
     ggml_tensor * fn, * as, * dv;
     float eps, clamp_val;
-    int n_used;
+    int n_used, T;
 };
 
 // RMS_NORM + MUL(ffn_norm.weight) + router span (12 nodes from i).
@@ -1696,7 +1795,9 @@ static bool frt_route_match(ggml_cgraph * cgraph, int i, frt_route_m & m) {
     const ggml_tensor * mm = nd[2];
     if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != fn || !strstr(mm->src[0]->name, ".ffn_gate_inp.weight")) return false;
     const ggml_tensor * x = rn->src[0], * nw = fn->src[1], * wr = mm->src[0];
-    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || ggml_nrows(x) != 1 || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != FRT_K_EMBD || !ggml_is_contiguous(x) || !frt_aligned16(x->data)) return false;
+    const int T = (int) ggml_nrows(x);
+    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
     if (nw->type != GGML_TYPE_F32 || ggml_nelements(nw) != FRT_K_EMBD || !frt_aligned16(nw->data)) return false;
     if (fn->type != GGML_TYPE_F32 || !ggml_is_contiguous(fn) || !frt_aligned16(fn->data)) return false;
     if (wr->type != GGML_TYPE_BF16 || wr->ne[0] != FRT_K_EMBD || wr->ne[1] != 256 || !ggml_is_contiguous(wr)) return false;
@@ -1714,11 +1815,12 @@ static bool frt_route_match(ggml_cgraph * cgraph, int i, frt_route_m & m) {
     if (sr->op != GGML_OP_SUM_ROWS || sr->src[0] != wrs) return false;
     if (cl->op != GGML_OP_CLAMP || cl->src[0] != sr) return false;
     if (dv->op != GGML_OP_DIV || dv->src[0] != wrs || dv->src[1] != cl || dv->type != GGML_TYPE_F32 || !ggml_is_contiguous(dv)) return false;
-    if (n_used < 1 || n_used > FRT_MOE_MAX_USED || tk->ne[1] != 1 || ggml_nrows(as) != 1 || as->ne[0] != 256) return false;
+    if (n_used < 1 || n_used > FRT_MOE_MAX_USED || tk->ne[1] != T || ggml_nrows(as) != T || as->ne[0] != 256) return false;
+    if (dv->ne[0] != n_used || ggml_nrows(dv) != T) return false;
     if (!frt_span_closed(cgraph, i, i + 11, { fn, as, tk })) return false;
     if (frt_overlap(fn, x) || frt_overlap(as, x) || frt_overlap(dv, x)) return false;
     float eps; memcpy(&eps, rn->op_params, sizeof(float));
-    m = { x, nw, wr, fn, as, dv, eps, ggml_get_op_params_f32(cl, 0), n_used };
+    m = { x, nw, wr, fn, as, dv, eps, ggml_get_op_params_f32(cl, 0), n_used, T };
     return true;
 }
 
@@ -1738,10 +1840,35 @@ static void frt_route_launch(ggml_backend_cuda_context & ctx, const frt_route_m 
     }
 }
 
+// T tokens: norm + q8 (T CTAs) -> router logits (32 CTAs) -> top-k + expert grouping (1 CTA)
+static bool frt_b_route_launch(ggml_backend_cuda_context & ctx, const frt_route_m & m, int i) {
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_kernel_launch(frt_b_norm_q8<16>, ggml_cuda_kernel_launch_params((dim3) m.T, (dim3) 512, 0, stream),
+        (const float *) m.x->data, (int64_t) FRT_K_EMBD, (const float *) m.nw->data, m.eps, (float *) m.fn->data, (int64_t) FRT_K_EMBD, g_b_q8, FRT_K_EMBD);
+    ggml_cuda_kernel_launch(frt_b_router<8>, ggml_cuda_kernel_launch_params((dim3) 32, (dim3) 256, 0, stream),
+        (const float *) m.fn->data, (const nv_bfloat16 *) m.wr->data, (int64_t) (m.wr->nb[1] / sizeof(nv_bfloat16)), g_b_logits, m.T);
+    float * chk = frt_b_check_begin(m.dv, i + 11, "route");
+    ggml_cuda_kernel_launch(frt_b_topk_group, ggml_cuda_kernel_launch_params((dim3) 1, (dim3) 256, 0, stream),
+        (const float *) g_b_logits, m.T, m.n_used, m.clamp_val,
+        (int32_t *) m.as->data, (int64_t) (m.as->nb[1] / sizeof(int32_t)), chk ? chk : (float *) m.dv->data, (int64_t) m.n_used,
+        g_b_ids, g_b_wts, g_b_eoff, g_b_slots, g_b_act);
+    if (chk) return false;
+    if (frt_h_check_on()) frt_h_check_route(stream, (const float *) m.fn->data, m.T, (const nv_bfloat16 *) m.wr->data, (int64_t) (m.wr->nb[1] / sizeof(nv_bfloat16)),
+        m.n_used, m.clamp_val, (const int32_t *) m.as->data, (int64_t) (m.as->nb[1] / sizeof(int32_t)), (const float *) m.dv->data);
+    return true;
+}
+
 static bool frt_route_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
     static const bool on = frt_window_on("GGML_FLASHRT_NO_ROUTE");
     frt_route_m m;
     if (!on || !frt_route_match(cgraph, i, m)) return false;
+    if (m.T > 1) {
+        const bool took = frt_b_route_launch(ctx, m, i);
+        g_act_q8_src = m.fn;
+        if (!took) return false;
+        *skip_count = 12;
+        return true;
+    }
     frt_route_launch(ctx, m);
     g_act_q8_src = m.fn;
     *skip_count = 12;
@@ -1755,7 +1882,6 @@ static bool frt_route_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
 // shared expert (gate, up, SwiGLU, down, scales) and both residual adds:
 // 14 stock launches -> 2.
 
-struct frt_moe_chain { float s1, b1, s2, b2, cmin, cmax, s3, b3; };
 
 // K1: one warp per GLU output; outputs [0, n_used*n_ff) routed, then n_ff_sh
 // shared. CTA 0 snapshots the routing ids / weights for K2.
@@ -1976,7 +2102,7 @@ struct frt_moeffn_m {
     const ggml_tensor * shgw, * shuw, * shdw, * shgs, * shus, * shds;
     ggml_tensor * l_out;
     frt_moe_chain ch;
-    int n_used, n_ff, n_ff_sh, K, end;
+    int n_used, n_ff, n_ff_sh, K, end, T;
 };
 
 static bool frt_moeffn_match(ggml_cgraph * cgraph, int i, frt_moeffn_m & m) {
@@ -1988,12 +2114,14 @@ static bool frt_moeffn_match(ggml_cgraph * cgraph, int i, frt_moeffn_m & m) {
     const ggml_tensor * ids = gate_id->src[2];
     const int64_t K = gw->ne[0], n_ff = gw->ne[1], n_exp = gw->ne[2];
     const int n_used = (int) ids->ne[0];
-    // pinned shapes: K = n_embd = 2048, n_ff = 512, M = 1, even n_used <= 8
+    // pinned shapes: K = n_embd = 2048, n_ff = 512, M = T tokens (1: decode windows), even n_used <= 8
     if (gw->type != GGML_TYPE_NVFP4 || K != FRT_K_EMBD || n_ff != 512) return false;
-    if (act->type != GGML_TYPE_F32 || act->ne[0] != K || act->ne[1] != 1 || act->ne[2] != 1 || !ggml_is_contiguous(act)) return false;
+    if (act->type != GGML_TYPE_F32 || act->ne[0] != K || act->ne[1] != 1 || !ggml_is_contiguous(act)) return false;
+    const int T = (int) act->ne[2];
+    if (T < 1 || T > FRT_B_TMAX || (T > 1 && !frt_b_on())) return false;
     // n_used < 8: the down kernel's prologue gives each routed slot a warp and needs one spare for the shared expert
-    if (ids->type != GGML_TYPE_I32 || ids->ne[1] != 1 || n_used < 2 || n_used >= FRT_MOE_MAX_USED || (n_used & 1)) return false;
-    if (gate_id->ne[1] != n_used || gate_id->ne[2] != 1) return false;
+    if (ids->type != GGML_TYPE_I32 || ids->ne[1] != T || n_used < 2 || n_used >= FRT_MOE_MAX_USED || (n_used & 1)) return false;
+    if (gate_id->ne[1] != n_used || gate_id->ne[2] != T) return false;
 
     ggml_tensor * up_id = nullptr, * glu = nullptr, * down_id = nullptr, * ex = nullptr, * dv = nullptr;
     const ggml_tensor * gate_mul = nullptr, * up_mul = nullptr, * down_mul = nullptr, * e_mul = nullptr, * w_mul = nullptr;
@@ -2079,12 +2207,12 @@ static bool frt_moeffn_match(ggml_cgraph * cgraph, int i, frt_moeffn_m & m) {
     if (sc[0]->src[0] != pool || ex->src[0] != sc[2] || clmp->src[0]->src[0] != sc[1]) return false;
     // weighted sum: e_mul = down_mul * ex, w_mul = e_mul * weights[1, n_used, 1]
     const ggml_tensor * wts = w_mul->src[1];
-    if (wts->type != GGML_TYPE_F32 || !ggml_is_contiguous(wts) || wts->ne[0] != 1 || wts->ne[1] != n_used) return false;
-    if (moe_out->ne[0] != K || moe_out->ne[1] != 1) return false;
+    if (wts->type != GGML_TYPE_F32 || !ggml_is_contiguous(wts) || wts->ne[0] != 1 || wts->ne[1] != n_used || ggml_nrows(wts) != n_used * T) return false;
+    if (moe_out->ne[0] != K || moe_out->ne[1] != T) return false;
     {   // expert sum in slot order: ((v0 + v1) + v2) + ... over views of w_mul
         auto slot_of = [&](const ggml_tensor * v) -> int {
-            if (v->op != GGML_OP_VIEW || v->view_src != w_mul || v->ne[0] != K || v->nb[0] != w_mul->nb[0]) return -1;
-            if (v->view_offs % w_mul->nb[1] != 0) return -1;
+            if (v->op != GGML_OP_VIEW || v->view_src != w_mul || v->ne[0] != K || v->nb[0] != w_mul->nb[0] || v->ne[1] != T) return -1;
+            if (v->view_offs % w_mul->nb[1] != 0 || (T > 1 && v->nb[1] != w_mul->nb[2])) return -1;
             return (int) (v->view_offs / w_mul->nb[1]);
         };
         const ggml_tensor * a = moe_out;
@@ -2105,8 +2233,8 @@ static bool frt_moeffn_match(ggml_cgraph * cgraph, int i, frt_moeffn_m & m) {
     if (!shgs || !shus || !shds) return false;
     if (!((ffn_out->src[0] == moe_out && ffn_out->src[1] == shd_mul))) return false;
     const ggml_tensor * resid = l_out->src[0] == ffn_out ? l_out->src[1] : (l_out->src[1] == ffn_out ? l_out->src[0] : nullptr);
-    if (!resid || l_out->src[0] != ffn_out || resid->type != GGML_TYPE_F32 || !ggml_is_contiguous(resid) || resid->ne[0] != K || resid->ne[1] != 1) return false;
-    if (l_out->type != GGML_TYPE_F32 || !ggml_is_contiguous(l_out) || l_out->ne[0] != K || l_out->ne[1] != 1) return false;
+    if (!resid || l_out->src[0] != ffn_out || resid->type != GGML_TYPE_F32 || !ggml_is_contiguous(resid) || resid->ne[0] != K || resid->ne[1] != T) return false;
+    if (l_out->type != GGML_TYPE_F32 || !ggml_is_contiguous(l_out) || l_out->ne[0] != K || l_out->ne[1] != T) return false;
     if (n_used * n_ff + n_ff_sh > FRT_MOE_GLU_CAP) return false;
     // K2 thread r reads resid[r] before writing out[r]: an exact alias is safe, a partial one is not
     if (l_out->data != resid->data && frt_overlap(l_out, resid)) return false;
@@ -2120,7 +2248,71 @@ static bool frt_moeffn_match(ggml_cgraph * cgraph, int i, frt_moeffn_m & m) {
 
     if (n_ff % 8 != 0 || n_ff_sh % (8 * QK8_1) != 0) return false;
     m = { act, ids, wts, resid, gw, uw, dw, gsc, usc, dsc, shgw, shuw, shdw, shgs, shus, shds, l_out, ch,
-          n_used, (int) n_ff, (int) n_ff_sh, (int) K, end };
+          n_used, (int) n_ff, (int) n_ff_sh, (int) K, end, T };
+    return true;
+}
+
+// T tokens: grouped gate/up (+ shared) -> rescale + q8 -> grouped down (+ shared) -> combine
+static bool frt_b_moeffn_launch(ggml_backend_cuda_context & ctx, const frt_moeffn_m & m, int i) {
+    cudaStream_t stream = ctx.stream();
+    const int T = m.T, n_used = m.n_used;
+    const int n_act_max = std::min(256, T * n_used);
+    const int ld_glu = n_used * m.n_ff + m.n_ff_sh;
+    const int ld_q8 = n_used * (m.n_ff / QK8_1) + m.n_ff_sh / QK8_1;
+    {   // gate/up
+        constexpr int RPW = 4, NW = 4, TT = 16;
+        frt_b_moe_args a = {};
+        a.q8 = g_b_q8; a.ld_q8 = FRT_K_EMBD / QK8_1; a.kq8 = 0; a.sh_q8_off = 0;
+        a.eoff = g_b_eoff; a.slots = g_b_slots; a.act = g_b_act;
+        a.w = (const char *) m.gw->data; a.w2 = (const char *) m.uw->data;
+        a.e_stride = m.gw->nb[2]; a.row_stride = m.gw->nb[1]; a.sh_row_stride = m.shgw->nb[1];
+        a.sc = (const float *) m.gsc->data; a.sc2 = (const float *) m.usc->data;
+        a.shw = (const char *) m.shgw->data; a.shw2 = (const char *) m.shuw->data;
+        a.shsc = (const float *) m.shgs->data; a.shsc2 = (const float *) m.shus->data;
+        a.out = g_b_glu; a.ld_out = ld_glu; a.k_out = m.n_ff;
+        a.sh_out = g_b_glu + n_used * m.n_ff; a.sh_ld = ld_glu;
+        a.n_rows = m.n_ff; a.sh_rows = m.n_ff_sh; a.T = T; a.n_used = n_used;
+        a.tiles_r = (m.n_ff + NW * RPW - 1) / (NW * RPW); a.fzero = 0.0f;
+        const int grid = n_act_max * a.tiles_r + (m.n_ff_sh + NW * RPW - 1) / (NW * RPW);
+        ggml_cuda_kernel_launch(frt_b_moe_gemv<FRT_K_EMBD / 64, FRT_K_EMBD / 64, RPW, NW, TT, true>,
+            ggml_cuda_kernel_launch_params((dim3) grid, (dim3) (NW * WARP_SIZE), 0, stream), a);
+    }
+    ggml_cuda_kernel_launch(frt_b_moe_glu_q8, ggml_cuda_kernel_launch_params((dim3) (T * (n_used + 1)), (dim3) 512, 0, stream),
+        (const float *) g_b_glu, (int64_t) ld_glu, n_used, m.n_ff, m.n_ff_sh, m.ch, g_b_esc, g_b_gluq8, ld_q8);
+    {   // down
+        constexpr int RPW = 4, NW = 8, TT = 32;
+        frt_b_moe_args a = {};
+        a.q8 = g_b_gluq8; a.ld_q8 = ld_q8; a.kq8 = m.n_ff / QK8_1; a.sh_q8_off = n_used * (m.n_ff / QK8_1);
+        a.eoff = g_b_eoff; a.slots = g_b_slots; a.act = g_b_act;
+        a.w = (const char *) m.dw->data; a.w2 = nullptr;
+        a.e_stride = m.dw->nb[2]; a.row_stride = m.dw->nb[1]; a.sh_row_stride = m.shdw->nb[1];
+        a.sc = (const float *) m.dsc->data; a.sc2 = nullptr;
+        a.shw = (const char *) m.shdw->data; a.shw2 = nullptr;
+        a.shsc = (const float *) m.shds->data; a.shsc2 = nullptr;
+        a.out = g_b_part; a.ld_out = (int64_t) n_used * m.K; a.k_out = m.K;
+        a.sh_out = g_b_shpart; a.sh_ld = m.K;
+        a.n_rows = m.K; a.sh_rows = m.K; a.T = T; a.n_used = n_used;
+        a.tiles_r = (m.K + NW * RPW - 1) / (NW * RPW); a.fzero = 0.0f;
+        const int grid = n_act_max * a.tiles_r + (m.K + NW * RPW - 1) / (NW * RPW);
+        ggml_cuda_kernel_launch(frt_b_moe_gemv<512 / 64, 1024 / 64, RPW, NW, TT, false>,
+            ggml_cuda_kernel_launch_params((dim3) grid, (dim3) (NW * WARP_SIZE), 0, stream), a);
+    }
+    float * chk = frt_b_check_begin(m.l_out, m.end, "moeffn");
+    ggml_cuda_kernel_launch(frt_b_moe_combine, ggml_cuda_kernel_launch_params(dim3(m.K / 256, T), (dim3) 256, 0, stream),
+        (const float *) g_b_part, (int64_t) n_used * m.K, (const float *) g_b_shpart,
+        (const int32_t *) g_b_ids, (const float *) g_b_wts, (const float *) g_b_esc, (const float *) m.dsc->data, (const float *) m.shds->data,
+        (const float *) m.resid->data, chk ? chk : (float *) m.l_out->data, n_used, m.K, 0.0f);
+    if (frt_stats_on()) {
+        static long fires = 0;
+        if ((++fires & 0xFFF) == 1) fprintf(stderr, "frt-stats moeffn-batched fires=%ld T=%d\n", fires, T);
+    }
+    if (chk) return false;
+    if (frt_h_check_on()) frt_h_check_moe(stream, (const float *) m.act->data, T, n_used, m.n_ff, m.n_ff_sh,
+        (const char *) m.gw->data, (const char *) m.uw->data, (const char *) m.dw->data, (size_t) m.gw->nb[2], (size_t) m.gw->nb[1], (size_t) m.dw->nb[2], (size_t) m.dw->nb[1],
+        (const float *) m.gsc->data, (const float *) m.usc->data, (const float *) m.dsc->data,
+        (const char *) m.shgw->data, (const char *) m.shuw->data, (const char *) m.shdw->data, (size_t) m.shgw->nb[1], (size_t) m.shdw->nb[1],
+        (const float *) m.shgs->data, (const float *) m.shus->data, (const float *) m.shds->data, m.ch,
+        (const float *) m.resid->data, (const float *) m.l_out->data);
     return true;
 }
 
@@ -2160,6 +2352,13 @@ static bool frt_moeffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     const ggml_tensor * act_src = m.act->view_src ? m.act->view_src : m.act;
     const bool act_q8 = act_src == g_act_q8_src && m.act->data == act_src->data;   // ROUTE published q8_1(act) for this layer
     g_act_q8_src = nullptr;
+    if (m.T > 1) {
+        if (!act_q8) return false;   // the batched span needs ROUTE's q8 activation and expert grouping
+        if (m.n_ff_sh != 1024 || m.K % 256 != 0) return false;
+        if (!frt_b_moeffn_launch(ctx, m, i)) return false;
+        *skip_count = m.end - i + 1;
+        return true;
+    }
     frt_moeffn_launch(ctx, m, act_q8);
     *skip_count = m.end - i + 1;
     return true;
@@ -2321,7 +2520,7 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
             const int h = g * FRT_FA_G + hl;
             float out[4];
             int   oix[4];
-            frt_qkn_vals<rope>(qkv + (size_t) h * D, qp.qn_w, lane, qp, out, oix);
+            frt_qkn_vals<rope>(qkv + (size_t) h * D, qp.qn_w, lane, qp, out, oix, qp.pos ? qp.pos[0] : 0);
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 sQ[hl][oix[k]] = out[k];
@@ -2339,7 +2538,7 @@ static __global__ void __launch_bounds__(FRT_FA_NW * WARP_SIZE, 1) frt_fa_decode
         if (own_k && warp == 0) {
             float out[4];
             int   oix[4];
-            frt_qkn_vals<rope>(qkv + (size_t) (qp.hq + g) * D, qp.kn_w, lane, qp, out, oix);
+            frt_qkn_vals<rope>(qkv + (size_t) (qp.hq + g) * D, qp.kn_w, lane, qp, out, oix, qp.pos ? qp.pos[0] : 0);
             half * dst = (half *) ((char *) qp.k_cache + (size_t) ck * qp.k_row_bytes) + (size_t) g * D;
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
@@ -2773,6 +2972,7 @@ static int g_frt_device = -1;
 
 bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
     if (!frt_layer_enabled() || ctx.device != g_frt_device) return false;
+    if (g_bchk.out) frt_b_check_compare(ctx, i);
     if (frt_attnqkv_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_route_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_denseffn_try(ctx, cgraph, i, skip_count)) return true;
@@ -2811,5 +3011,6 @@ void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
         CUDA_CHECK(cudaMalloc(&g_moe_tail.wts, FRT_MOE_MAX_USED * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_fa_ml, (size_t) FRT_FA_HEADS_MAX * FRT_FA_MAX_SPLITS * sizeof(frt_fa_part)));
         CUDA_CHECK(cudaMalloc(&g_fa_o, (size_t) FRT_FA_HEADS_MAX * FRT_FA_MAX_SPLITS * FRT_FA_D * sizeof(float)));
+        frt_b_alloc();
     }
 }
