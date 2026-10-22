@@ -129,7 +129,10 @@ GGML_CUDA_DISABLE_GRAPHS=1 FRT_B_HREF=1 llama-perplexity -m <nvfp4.gguf> -ngl 99
 prints one `frt-href <window> call <k> ... bad <n>` line per window and call
 (the two-token warm-up is skipped). Gate: `bad 0` for every window, `max_rel`
 at the 1e-4 level only where the reference value is tiny, `int8 flips 0`
-for the device-vs-host quantization of the same rows. Run it at `-ub 8`,
+for the device-vs-host quantization of the same rows (`qkv-q8`, `dense-q8`,
+`moe-q8`). `oproj-q8` requantizes the device's fp32 attention output on the
+host and may show a few single-LSB flips on rounding ties; they do not enter
+the dot-product reference, which consumes the device's q8 blocks. Run it at `-ub 8`,
 `24` and `64` (one, two and four token tiles). The batched attention has its
 own check: `FRT_ATTNDEC_CHECK=<k> FRT_ATTNDEC_CHECK_REF=vec` on
 `llama-batched-bench` (eager mode) reports the per-call difference against
