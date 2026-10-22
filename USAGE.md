@@ -161,11 +161,14 @@ is slower.
 
 Numerics. The default path is exact: decode and prefill logits are
 bit-identical to stock llama.cpp at the same `-ub` (the windows reproduce
-ggml's per-element arithmetic order; see TESTING.md). The only
-non-bitwise component is the opt-in decode attention `FRT_ATTNDEC=1`
-(tensor-core GQA attention with f32-level operands, per-call relative
-error vs ggml ~1e-6), gated by perplexity/KLD against stock's own
-prefill-vs-decode variation.
+ggml's per-element arithmetic order; TESTING.md lists the coverage). The
+only non-bitwise component is the opt-in decode attention `FRT_ATTNDEC=1`
+(tensor-core GQA attention with f32-level operands), gated by
+perplexity/KLD against stock's own prefill-vs-decode variation. Per call
+it differs from ggml's f32 vector kernel by ~5e-7 relative (max 4e-6).
+From 8K cached tokens on, stock decode switches its full-attention layers
+to an f16 tensor-core kernel (GQA ratio > 4); the difference to that
+kernel is its f16 rounding of Q and P (~6e-4).
 
 | variable | effect |
 |---|---|
@@ -176,6 +179,11 @@ prefill-vs-decode variation.
 | `FRT_ATTNDEC_CHECK=<k>` | test aid: every k-th ATTNDEC call is compared against ggml's kernel (eager mode only, `GGML_CUDA_DISABLE_GRAPHS=1`) |
 | `FRT_PF_CHECK=1` | test aid: the prefill MoE tail window compares against ggml's own execution (eager mode) |
 | `FRT_STATS=1`, `FRT_DUMP_GRAPH=1` + `FRT_DUMP_M=<m>` (+ `FRT_DUMP_PATH`) | diagnostics |
+
+The windows' scratch buffers belong to one GPU (the first SM120 device
+that runs a graph; any other device runs stock) and to one active context:
+run one Flint context per GPU at a time (one `llama-server` process with
+any number of slots is one context).
 
 Host-side switches added by the Flint patch series (all default on,
 identical results either way):

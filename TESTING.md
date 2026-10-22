@@ -82,13 +82,15 @@ primary gate is logit identity, checked with a teacher-forced driver that
 records an FNV-1a hash of every position's f32 logits:
 
 - **Decode path** (`n_batch = 1`, every position through the M = 1 graph):
-  hashes equal to stock for 1024 positions of mixed text and for a
+  hashes equal to stock for 1024 positions of mixed text, for a
   ~100K-position code corpus (cache filled to ~100K), and for 4096
   positions with a 4096-ubatch context (large sliding-window ring).
-- **Prefill path** (`n_batch = 2048` and `4096`): hashes equal to stock at
-  the same ubatch for 8192 tokens. Different ubatch sizes are different
-  stock numerics (tiling, stream-k splits) and are compared by perplexity,
-  not by hash.
+- **Prefill path**: hashes equal to stock at the same ubatch for 8192
+  tokens of code at `-ub` 512, 2048, 4096, 8192 and 3000 (a partial last
+  ubatch), and for 512 tokens at ubatches of 2, 4, 8 and 32 tokens (the
+  M = 2..8 paths that batched decode also takes). Different ubatch sizes
+  are different stock numerics (tiling, stream-k splits) and are compared
+  by perplexity, not by hash.
 - **Served A/B/A** — stock, candidate, stock as three server processes on
   real coding/agent prompts (cache-cold, `cache_prompt: false`, streamed
   for time to first token, fixed decode budget with `ignore_eos`); greedy
@@ -99,11 +101,15 @@ records an FNV-1a hash of every position's f32 logits:
 
 Non-bitwise options (`FRT_ATTNDEC=1`) are gated by quality instead:
 per-call error against ggml's kernel (`FRT_ATTNDEC_CHECK`), paired
-`llama-perplexity --kl-divergence` against stock decode logits (2K and
-32K context), compared with stock's own prefill-vs-decode KLD (this model
+`llama-perplexity --kl-divergence` against stock decode logits (2K
+context; decode-path perplexity at 32K), compared with stock's own
+prefill-vs-decode KLD (this model
 shows KLD ~0.24 on code between two stock paths: any perturbation, even
 1e-6 per call, saturates to that level), and generated-code pass rates.
 
 Window triggering is verified with an nsys kernel census (the replaced
 stock kernels must disappear); a window that never fires is bit-identical
-and speed-neutral by construction.
+and speed-neutral by construction. `FRT_STATS=1` also reports whether the
+MoE window reuses the router window's quantized activation
+(`moeffn ... act_q8=1`); a host change that breaks that handoff stays
+exact but loses speed, so it is part of the check.

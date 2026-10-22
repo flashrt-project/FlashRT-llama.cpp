@@ -21,12 +21,18 @@ model_shapes:            # asserted at match time
 gates:
   quality:
     decode_logits_vs_stock: bit_identical       # teacher-forced n_batch 1: 1024 positions (mixed text),
-                                                # ~100K positions (code corpus), 4096 positions with -ub 4096
-    prefill_logits_vs_stock: bit_identical      # 8192 tokens at -ub 2048 and -ub 4096
+                                                # 99,673 positions (code corpus), 4096 positions with -ub 4096
+    prefill_logits_vs_stock: bit_identical      # 8192 tokens at -ub 512/2048/4096/8192/3000 (partial last
+                                                # ubatch); 512 tokens at ubatches of 2/4/8/32
     real_suite_tokens_vs_stock: identical       # 8 coding/agent prompts, 512 greedy tokens
-    attndec_opt_in: {per_call_rel_err_max: 3.9e-6, kld_code_c2048: 0.236, stock_path_kld_reference: 0.239}
-  perf:                  # llama-bench, f16 KV, -fa on
-    tg128_d0: 550.2
-    tg128_d100k: 265.3
-    pp8192_ub4096: 16484
-    stock_reference: {tg128_d0: 242.5, tg128_d100k: 151.8, pp8192_ub512: 7236, pp8192_ub4096: 12000}
+    route_moe_handoff: "FRT_STATS=1 reports moeffn act_q8=1"
+    attndec_opt_in:                             # per-call max relative difference to ggml's kernel for the node
+      vs_vec_f32_nkv_lt_8192: {median: 4.8e-7, max: 4.3e-6}
+      vs_mma_f16_nkv_ge_8192: {median: 5.6e-4, max: 4.2e-3}   # stock's own kernel there rounds Q, P to f16
+      kld_code_c2048: 0.236
+      stock_path_kld_reference: 0.239
+  perf:                  # llama-bench, f16 KV, -fa on; d100k = median of 3 fresh processes
+    tg128_d0: 550.1
+    tg128_d100k: 264.9
+    pp8192_ub4096: 16419
+    stock_reference: {tg128_d0: 242.1, tg128_d100k: 162.0, pp8192_ub512: 7219, pp8192_ub4096: 11990}
