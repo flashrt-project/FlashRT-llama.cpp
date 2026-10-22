@@ -1845,7 +1845,7 @@ static bool frt_b_route_launch(ggml_backend_cuda_context & ctx, const frt_route_
     cudaStream_t stream = ctx.stream();
     ggml_cuda_kernel_launch(frt_b_norm_q8<16>, ggml_cuda_kernel_launch_params((dim3) m.T, (dim3) 512, 0, stream),
         (const float *) m.x->data, (int64_t) FRT_K_EMBD, (const float *) m.nw->data, m.eps, (float *) m.fn->data, (int64_t) FRT_K_EMBD, g_b_q8, FRT_K_EMBD);
-    ggml_cuda_kernel_launch(frt_b_router<8>, ggml_cuda_kernel_launch_params((dim3) 32, (dim3) 256, 0, stream),
+    ggml_cuda_kernel_launch(frt_b_router<4>, ggml_cuda_kernel_launch_params((dim3) 64, (dim3) 256, 0, stream),
         (const float *) m.fn->data, (const nv_bfloat16 *) m.wr->data, (int64_t) (m.wr->nb[1] / sizeof(nv_bfloat16)), g_b_logits, m.T);
     float * chk = frt_b_check_begin(m.dv, i + 11, "route");
     ggml_cuda_kernel_launch(frt_b_topk_group, ggml_cuda_kernel_launch_params((dim3) ((m.T + 7) / 8), (dim3) 256, 0, stream),
@@ -2259,6 +2259,7 @@ static bool frt_b_moeffn_launch(ggml_backend_cuda_context & ctx, const frt_moeff
     const int n_act_max = std::min(256, T * n_used);
     const int ld_glu = n_used * m.n_ff + m.n_ff_sh;
     const int ld_q8 = n_used * (m.n_ff / QK8_1) + m.n_ff_sh / QK8_1;
+    static const int dbg = getenv("FRT_B_DBG") ? atoi(getenv("FRT_B_DBG")) : 0;
     {   // gate/up
         constexpr int RPW = 4, NW = 4, TT = 16;
         frt_b_moe_args a = {};
@@ -2272,8 +2273,13 @@ static bool frt_b_moeffn_launch(ggml_backend_cuda_context & ctx, const frt_moeff
         a.out = g_b_glu; a.ld_out = ld_glu; a.k_out = m.n_ff;
         a.sh_out = g_b_glu + n_used * m.n_ff; a.sh_ld = ld_glu;
         a.n_rows = m.n_ff; a.sh_rows = m.n_ff_sh; a.T = T; a.n_used = n_used;
-        a.tiles_r = (m.n_ff + NW * RPW - 1) / (NW * RPW); a.fzero = 0.0f;
-        if (!frt_b_dp4a()) {
+        a.tiles_r = (m.n_ff + NW * RPW - 1) / (NW * RPW); a.fzero = 0.0f; a.dbg = dbg;
+        static const bool persist = getenv("FRT_P_ON") && getenv("FRT_P_ON")[0] == '1';
+        if (!frt_b_dp4a() && persist) {
+            a.tiles_r = (m.n_ff + FRT_M_ROWS - 1) / FRT_M_ROWS;   // RT = 1
+            const frt_p_geom gr = { FRT_K_EMBD / 64, 1, 1168 }, gs = { FRT_K_EMBD / 64, 1, 1168 };
+            frt_p_moe_launch<true>(a, gr, gs, stream);
+        } else if (!frt_b_dp4a()) {
             a.tiles_r = (m.n_ff + FRT_M_ROWS - 1) / FRT_M_ROWS;
             frt_m_moe_launch<FRT_K_EMBD / 64, FRT_K_EMBD / 64, 8, 1, true>(a, n_act_max, stream);
         } else {
@@ -2297,8 +2303,13 @@ static bool frt_b_moeffn_launch(ggml_backend_cuda_context & ctx, const frt_moeff
         a.out = g_b_part; a.ld_out = (int64_t) n_used * m.K; a.k_out = m.K;
         a.sh_out = g_b_shpart; a.sh_ld = m.K;
         a.n_rows = m.K; a.sh_rows = m.K; a.T = T; a.n_used = n_used;
-        a.tiles_r = (m.K + NW * RPW - 1) / (NW * RPW); a.fzero = 0.0f;
-        if (!frt_b_dp4a()) {
+        a.tiles_r = (m.K + NW * RPW - 1) / (NW * RPW); a.fzero = 0.0f; a.dbg = dbg;
+        static const bool persist = getenv("FRT_P_ON") && getenv("FRT_P_ON")[0] == '1';
+        if (!frt_b_dp4a() && persist) {
+            a.tiles_r = (m.K + 64 - 1) / 64;   // RT = 4 (64 rows per item, K = 512); shared RT = 2 (K = 1024)
+            const frt_p_geom gr = { 512 / 64, 4, 288 + 16 }, gs = { 1024 / 64, 2, 576 + 16 };
+            frt_p_moe_launch<false>(a, gr, gs, stream);
+        } else if (!frt_b_dp4a()) {
             a.tiles_r = (m.K + FRT_M_ROWS - 1) / FRT_M_ROWS;
             frt_m_moe_launch<512 / 64, 1024 / 64, 4, 1, false>(a, n_act_max, stream);
         } else {

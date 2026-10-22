@@ -203,6 +203,7 @@ struct frt_b_gemv_args {
     int n_rows;
     int T;
     float fzero;
+    int dbg;   // FRT_B_DBG timing aid: 1 skip compute, 2 skip staging, 4 skip weight loads
 };
 
 template <int KB, int RPW, int NW, int TT, int EPI>
@@ -298,6 +299,7 @@ struct frt_b_moe_args {
     int T, n_used;
     int tiles_r;                // row tiles per routed expert; shared tiles follow
     float fzero;
+    int dbg;
 };
 
 #include "fr_win_flint_bmma.cuh"
@@ -307,8 +309,10 @@ static bool frt_b_dp4a() {
     return on;
 }
 // sm_120 allows 99 KB of shared memory per block: token tiles of 32 / 16 / 8 for K = 2048 / 4096 / 6144
-template <int KB, int EPI> struct frt_m_ntt { static constexpr int v = KB <= 64 ? 2 : 1; };   // 16-token tiles (8 for K = 6144)
-template <int KB> struct frt_m_nw { static constexpr int v = KB <= 32 ? 8 : 16; };
+template <int KB, int EPI> struct frt_m_ntt { static constexpr int v = KB <= 32 ? 2 : 1; };   // double-buffered tiles: 16 tokens (K = 2048), 8 (K = 4096 / 6144)
+template <int KB, int EPI> struct frt_m_nw { static constexpr int v = KB <= 32 ? 8 : 16; };
+// m-tiles per CTA: 2 for K = 2048 (weights 2 x 4 warps x 8 blocks in registers), 1 otherwise; dense GLU stays at 1
+template <int KB, int EPI> struct frt_m_mt { static constexpr int v = (KB <= 32 && EPI != FRT_B_EPI_GLU) ? 2 : 1; };
 
 // token-tile size per K: keep the static shared buffer under 48 KB
 template <int KB> struct frt_b_tt { static constexpr int v = KB <= 16 ? 32 : KB <= 32 ? 16 : KB <= 64 ? 8 : 4; };
@@ -317,7 +321,9 @@ template <int KB, int EPI>
 static void frt_b_gemv_launch(const frt_b_gemv_args & a, cudaStream_t stream) {
     constexpr int NW = FRT_B_NW, TT = frt_b_tt<KB>::v;
     if (!frt_b_dp4a()) {
-        frt_m_gemv_launch<KB, frt_m_nw<KB>::v, frt_m_ntt<KB, EPI>::v, EPI>(a, stream);
+        static const int dbg = getenv("FRT_B_DBG") ? atoi(getenv("FRT_B_DBG")) : 0;
+        frt_b_gemv_args ad = a; ad.dbg = dbg;
+        frt_m_gemv_launch<KB, frt_m_nw<KB, EPI>::v, frt_m_mt<KB, EPI>::v, frt_m_ntt<KB, EPI>::v, EPI>(ad, stream);
         return;
     }
     // rows per warp: as many as keep >= ~256 CTAs
