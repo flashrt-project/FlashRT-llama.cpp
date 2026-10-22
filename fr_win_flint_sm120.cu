@@ -1193,7 +1193,7 @@ static float * g_pf_moe = nullptr;   // routed sum [n_embd, T], private (x may s
 // FRT_PF_CHECK=1 (eager test aid): compute into private buffers, let ggml run the nodes, compare at the next node
 struct frt_pf_check_state { const ggml_tensor * lo = nullptr; float * mine_out = nullptr, * pg = nullptr, * pu = nullptr, * pglu = nullptr, * pd = nullptr; int64_t n = 0; };
 static frt_pf_check_state g_pf_chk;
-static constexpr int64_t FRT_PF_TOKENS_MAX = 8192;
+static constexpr int64_t FRT_PF_TOKENS_MAX = 4096;   // prefill windows: ubatch <= 4096
 
 // moe[t][r] = sum_k ((x[t][k][r] * s[ids[t][k]]) * e[t][k]) * w[t][k], k ascending.
 // ggml runs the products and the sum as separate kernels: __fmul_rn / __fadd_rn keep the
@@ -1372,6 +1372,130 @@ static bool frt_moetailpf_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
         return false;
     }
     *skip_count = 25;
+    return true;
+}
+
+// ---- prefill routed gate/up epilogue (FRT window GUGLUPF, M > 1) -------------
+// gate GEMM -> expert scale MUL; up GEMM (stock MMQ) -> expert scale MUL;
+// SwiGLU; the ten-node amax rescale chain; DIV: one kernel per (slot, token)
+// row after the up GEMM, same operation order as the stock kernels (the
+// products are __fmul_rn: ggml runs them as separate kernels).
+
+static float * g_pf_up = nullptr;   // up GEMM output [n_ff, n_used, T], private (it may land on the raw gate buffer otherwise)
+
+template <int NT, int VPT>
+static __global__ void __launch_bounds__(NT) frt_pf_glu_amax(
+        const float * gate, const float * up, const int32_t * ids, const int64_t ids_stride, const int n_used,
+        const float * gsc, const float * usc, float * out, float * e_out,
+        const float s1, const float b1, const float s2, const float b2,
+        const float cmin, const float cmax, const float s3, const float b3) {
+    constexpr int n = NT * VPT;   // n_ff (pinned by the predicate)
+    const int rr = blockIdx.x;    // row = t * n_used + k
+    const int t = rr / n_used, k = rr % n_used;
+    const int ex = ids[(int64_t) t * ids_stride + k];
+    const float sg = gsc[ex], su = usc[ex];
+    const float * gr = gate + (int64_t) rr * n;
+    const float * ur = up   + (int64_t) rr * n;
+    float v[VPT];
+    float m = -FLT_MAX;
+#pragma unroll
+    for (int q = 0; q < VPT; ++q) {
+        const int j = threadIdx.x + q * NT;
+        const float gs = __fmul_rn(gr[j], sg);
+        const float us = __fmul_rn(ur[j], su);
+        v[q] = ggml_cuda_op_silu_single(gs) * us;   // GLU swiglu
+        m = fmaxf(m, fabsf(v[q]));                  // ABS, POOL_1D max
+    }
+    m = warp_reduce_max(m);
+    __shared__ float red[NT / WARP_SIZE];
+    __shared__ float e_sh;
+    if (threadIdx.x % WARP_SIZE == 0) red[threadIdx.x / WARP_SIZE] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float a = red[0];
+#pragma unroll
+        for (int w = 1; w < NT / WARP_SIZE; ++w) a = fmaxf(a, red[w]);
+        float e = s1 * a + b1;      // SCALE
+        e = logf(e);                // LOG
+        e = s2 * e + b2;            // SCALE
+        e = ceilf(e);               // CEIL
+        e = fminf(fmaxf(e, cmin), cmax);   // CLAMP
+        e = s3 * e + b3;            // SCALE
+        e = expf(e);                // EXP
+        e_sh = e;
+        e_out[rr] = e;
+    }
+    __syncthreads();
+    const float e = e_sh;
+    float * o = out + (int64_t) rr * n;
+#pragma unroll
+    for (int q = 0; q < VPT; ++q) {
+        o[threadIdx.x + q * NT] = v[q] / e;   // DIV
+    }
+}
+
+// anchor: REPEAT(scale of ffn_gate_exps) at M > 1
+static bool frt_guglupf_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
+    static const bool on = frt_window_on("GGML_FLASHRT_NO_GUGLUPF");
+    if (!on || g_pf_up == nullptr || i + 18 >= cgraph->n_nodes) return false;
+    ggml_tensor * const * n = cgraph->nodes + i;
+    const ggml_tensor * grep = n[0], * ggr = n[1], * gsm = n[2], * umm = n[3], * urs = n[4], * urep = n[5], * ugr = n[6], * usm = n[7], * glu = n[8];
+    if (grep->op != GGML_OP_REPEAT || ggr->op != GGML_OP_GET_ROWS || ggr->src[0] != grep) return false;
+    const ggml_tensor * gsc = grep->src[0]->op == GGML_OP_RESHAPE ? grep->src[0]->src[0] : grep->src[0];
+    if (!strstr(gsc->name, ".ffn_gate_exps.scale")) return false;
+    if (gsm->op != GGML_OP_MUL || gsm->src[1] != ggr) return false;
+    const ggml_tensor * gmm = gsm->src[0];
+    if (gmm->op != GGML_OP_MUL_MAT_ID || umm->op != GGML_OP_MUL_MAT_ID || !strstr(umm->src[0]->name, ".ffn_up_exps.weight")) return false;
+    if (umm->src[1] != gmm->src[1] || umm->src[2] != gmm->src[2]) return false;
+    if (urs->op != GGML_OP_RESHAPE || urep->op != GGML_OP_REPEAT || urep->src[0] != urs || ugr->op != GGML_OP_GET_ROWS || ugr->src[0] != urep) return false;
+    const ggml_tensor * usc = urs->src[0];
+    if (!strstr(usc->name, ".ffn_up_exps.scale") || usm->op != GGML_OP_MUL || usm->src[0] != umm || usm->src[1] != ugr) return false;
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->src[0] != gsm || glu->src[1] != usm) return false;
+    const ggml_tensor * ids = gmm->src[2];
+    if (ggr->src[1] != ids || ugr->src[1] != ids) return false;
+    // amax chain (same predicate as the AMAX window)
+    static const ggml_op ops[10] = { GGML_OP_UNARY, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_LOG, GGML_OP_SCALE,
+                                     GGML_OP_UNARY, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_DIV };
+    for (int k = 0; k < 10; ++k) {
+        if (n[9 + k]->op != ops[k]) return false;
+        if (k > 0 && k < 9 && n[9 + k]->src[0] != n[8 + k]) return false;
+    }
+    if (n[9]->src[0] != glu || !frt_unary_is(n[9], GGML_UNARY_OP_ABS) || !frt_unary_is(n[14], GGML_UNARY_OP_CEIL) || !frt_unary_is(n[17], GGML_UNARY_OP_EXP)) return false;
+    const ggml_tensor * pool = n[10], * sc1 = n[11], * sc2 = n[13], * clmp = n[15], * sc3 = n[16];
+    ggml_tensor * ex = n[17], * dv = n[18];
+    if (dv->src[0] != glu || dv->src[1] != ex) return false;
+    const int64_t n_ff = gmm->ne[0], n_used = gmm->ne[1], T = gmm->ne[2];
+    const int32_t * pp = (const int32_t *) pool->op_params;
+    if (pp[0] != GGML_OP_POOL_MAX || pp[1] != n_ff || pp[2] != n_ff || pp[3] != 0 || pool->ne[0] != 1) return false;
+    if (T <= 1 || T > FRT_PF_TOKENS_MAX || n_ff != 512 || n_used != 6) return false;
+    for (const ggml_tensor * t : { gmm, umm, gsm, usm, glu, (const ggml_tensor *) dv }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] != n_ff || t->ne[1] != n_used || t->ne[2] != T) return false;
+    }
+    if (ex->type != GGML_TYPE_F32 || !ggml_is_contiguous(ex) || ggml_nelements(ex) != n_used * T) return false;
+    if (ids->type != GGML_TYPE_I32 || ids->ne[0] != n_used || ids->nb[0] != sizeof(int32_t)) return false;
+    for (const ggml_tensor * sc : { gsc, usc }) {
+        if (sc->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc) || ggml_nelements(sc) != gmm->src[0]->ne[2]) return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (T <= MMVQ_MAX_BATCH_SIZE || !ggml_cuda_should_use_mmq(umm->src[0]->type, cc, umm->src[1]->ne[2], umm->src[0]->ne[2])) return false;
+    // every node except e (also read by the routed down tail) and the DIV output stays inside
+    if (!frt_span_closed(cgraph, i, i + 18, { ex })) return false;
+    // the raw gate rows are read while e / the DIV output are written: no partial overlap
+    if (frt_overlap(ex, gmm) || (dv->data != gmm->data && frt_overlap(dv, gmm)) || frt_overlap(ex, dv)) return false;
+
+    cudaStream_t stream = ctx.stream();
+    ggml_tensor up_dst = *umm;
+    up_dst.data = g_pf_up;
+    ggml_cuda_mul_mat_q(ctx, umm->src[0], umm->src[1], ids, &up_dst);
+    frt_pf_glu_amax<128, 4><<<(unsigned) (n_used * T), 128, 0, stream>>>(
+        (const float *) gmm->data, g_pf_up, (const int32_t *) ids->data, (int64_t) (ids->nb[1] / sizeof(int32_t)), (int) n_used,
+        (const float *) gsc->data, (const float *) usc->data, (float *) dv->data, (float *) ex->data,
+        ggml_get_op_params_f32(sc1, 0), ggml_get_op_params_f32(sc1, 1),
+        ggml_get_op_params_f32(sc2, 0), ggml_get_op_params_f32(sc2, 1),
+        ggml_get_op_params_f32(clmp, 0), ggml_get_op_params_f32(clmp, 1),
+        ggml_get_op_params_f32(sc3, 0), ggml_get_op_params_f32(sc3, 1));
+    *skip_count = 19;
     return true;
 }
 
@@ -2638,6 +2762,7 @@ bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     if (frt_lmhead_try(ctx, cgraph, i, skip_count)) return true;
     if (g_pf_chk.lo) frt_pf_check_compare(ctx, cgraph, i);
     if (frt_moetailpf_try(ctx, cgraph, i, skip_count)) return true;
+    if (frt_guglupf_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_oproj_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_attndec_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_moeffn_try(ctx, cgraph, i, skip_count)) return true;
@@ -2655,6 +2780,7 @@ void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
         CUDA_CHECK(cudaMalloc(&g_dense_glu, FRT_DFF * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_lm_q8, (FRT_K_EMBD / QK8_1) * sizeof(block_q8_1)));
         CUDA_CHECK(cudaMalloc(&g_pf_moe, (size_t) FRT_PF_TOKENS_MAX * FRT_K_EMBD * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_pf_up, (size_t) FRT_PF_TOKENS_MAX * 6 * 512 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_route_logits, 256 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_route_count, sizeof(unsigned int)));
         CUDA_CHECK(cudaMemset(g_route_count, 0, sizeof(unsigned int)));
