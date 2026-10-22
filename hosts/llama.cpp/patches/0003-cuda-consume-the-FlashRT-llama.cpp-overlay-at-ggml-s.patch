@@ -1,5 +1,5 @@
 From ab3d3dc5de3fcd4427f379009eb6092e835e627f Mon Sep 17 00:00:00 2001
-From: LiangSu8899 <1342163629@qq.com>
+From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Fri, 11 Sep 2026 16:20:41 -0400
 Subject: [PATCH 3/3] cuda: consume the FlashRT-llama.cpp overlay at
  ggml/src/ggml-cuda/flashrt

@@ -159,10 +159,11 @@ llama-server -m flint-nvfp4.gguf -ngl 99 -c <ctx> -np 1 -fa on -ctk f16 -ctv f16
 decode speed does not depend on it with this host (patch 0006). `-ub 8192`
 is slower.
 
-Numerics. The default path is exact: decode and prefill logits are
-bit-identical to stock llama.cpp at the same `-ub` (the windows reproduce
-ggml's per-element arithmetic order; TESTING.md lists the coverage). The
-only non-bitwise component is the opt-in decode attention `FRT_ATTNDEC=1`
+Numerics. The M = 1 windows and stock fallbacks are bit-identical to stock
+llama.cpp at the same `-ub`. Set `GGML_FLASHRT_NO_BATCHED=1` to reproduce the
+original bit-exact decode/prefill protocol in TESTING.md. The default
+batched windows change fp32 summation order and use the host-reference gate
+below. The M = 1 opt-in decode attention `FRT_ATTNDEC=1`
 (tensor-core GQA attention with f32-level operands), gated by
 perplexity/KLD against stock's own prefill-vs-decode variation. Per call
 it differs from ggml's f32 vector kernel by ~5e-7 relative (max 4e-6) at
@@ -233,6 +234,7 @@ identical results either way):
 5–10% faster (1K–32K prompts) and greedy outputs are unchanged; sampled
 outputs come from the GPU sampler's random stream instead of the CPU one.
 Setting a backend sampler re-reserves the scheduler for every request;
-with patch 0008 that no longer reallocates the compute buffers, so time to
+with patches 0008–0009 that no longer reallocates the compute buffers while
+the node budget fits, so time to
 first token is the same as with CPU sampling (without it, +~0.13 s per
 request at `-ub 4096`).

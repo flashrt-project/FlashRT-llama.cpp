@@ -1,5 +1,5 @@
 From e190b4433287f79f41535bf59a55c6c4d4554dd2 Mon Sep 17 00:00:00 2001
-From: LiangSu8899 <1342163629@qq.com>
+From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Fri, 11 Sep 2026 14:09:26 -0400
 Subject: [PATCH 2/3] cuda: FlashRT adapter now lives at hosts/ggml in the
  FlashRT checkout

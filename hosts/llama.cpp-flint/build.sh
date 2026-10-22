@@ -7,7 +7,7 @@
 # Clones llama.cpp, fetches the Flint PR head, checks out the pinned commit
 # (PIN), applies the patch series, mounts this overlay at
 # ggml/src/ggml-cuda/flashrt and builds llama-server, llama-bench,
-# llama-cli and llama-perplexity. Set FLASHRT_OVERLAY to use a different
+# llama-cli, llama-perplexity and llama-batched-bench. Set FLASHRT_OVERLAY to use a different
 # overlay checkout (default: the one this script is in).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"

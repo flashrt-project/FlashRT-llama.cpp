@@ -16,6 +16,7 @@
 
 #include <map>
 #include <string>
+#include <cmath>
 
 static constexpr int FRT_B_TMAX = 512;         // tokens per ubatch handled by the routing / MoE windows (buffers)
 static constexpr int FRT_B_DENSE_TMAX = 128;   // dense projections / attention front / LM head: beyond this stock MMQ is the better GEMM
@@ -406,14 +407,38 @@ static void frt_h_q8_from_dev(const block_q8_1 * dev, const int K, frt_h_q8 & o)
         o.d[c] = __half2float(__low2half(b[c].ds));
     }
 }
-// device quantization vs host quantization of the same f32 row: flips (int8 differs by 1) and scale mismatches
+// Keep raw flip counts, but distinguish proven one-LSB rounding ties from
+// unexplained mismatches. CUDA's fast division and host division can straddle
+// a half-integer within two fp32 ULPs even for the same input row. The QKV
+// check reconstructs a host norm instead, so it still requires zero flips.
 static void frt_h_quant_cmp(const char * name, const float * x, const frt_h_q8 & dev, const int K, long & flips, long & dbad) {
     frt_h_q8 h; frt_h_quant(x, K, h);
-    for (int j = 0; j < K; ++j) if (h.q[j] != dev.q[j]) ++flips;
+    long ties = 0;
+    double max_tie_distance = 0.0;
+    for (int j = 0; j < K; ++j) if (h.q[j] != dev.q[j]) {
+        ++flips;
+        float amax = 0.0f;
+        const int c = j / 32;
+        for (int k = 0; k < 32; ++k) amax = std::max(amax, fabsf(x[c * 32 + k]));
+        const float d = amax / 127.0f;
+        const double ratio = (double) x[j] / (double) d;
+        const float magnitude = fabsf((float) ratio);
+        const double ulp = (double) nextafterf(magnitude, INFINITY) - magnitude;
+        const double lower = floor(ratio), distance = fabs(ratio - (lower + 0.5));
+        const int lo = std::min((int) h.q[j], (int) dev.q[j]);
+        const int hi = std::max((int) h.q[j], (int) dev.q[j]);
+        if (strcmp(name, "qkv") != 0 && std::isfinite(ratio) && lo == lower && hi == lower + 1 && distance <= 2 * ulp) {
+            ++ties;
+            max_tie_distance = std::max(max_tie_distance, distance);
+        } else {
+            fprintf(stderr, "frt-href quant-bad %s j=%d ratio=%.17g host=%d device=%d\n",
+                    name, j, ratio, (int) h.q[j], (int) dev.q[j]);
+        }
+    }
     for (int c = 0; c < K / 32; ++c) if (h.d[c] != dev.d[c]) ++dbad;
-    GGML_UNUSED(name);
+    if (ties) fprintf(stderr, "frt-href quant-ties %s: %ld verified one-LSB flips within 2 fp32 ULPs of a half-integer (max_distance %.3e)\n",
+                      name, ties, max_tie_distance);
 }
-
 static float frt_h_ue4m3(uint8_t x) {
     if (x == 0 || x == 0x7F || x == 0xFF) return 0.0f;
     const int exp = (x >> 3) & 0xF, man = x & 7;
@@ -452,6 +477,11 @@ static float frt_h_silu(float x) { return x / (1.0f + expf(-x)); }
 
 struct frt_h_cmp { double max_abs = 0, max_rel = 0, sum_abs = 0, sum_ref = 0; long n = 0, bad = 0; };
 static void frt_h_acc(frt_h_cmp & c, double mine, double ref) {
+    if (!std::isfinite(mine) || !std::isfinite(ref)) {
+        ++c.bad; ++c.n;
+        c.max_abs = c.max_rel = INFINITY;
+        return;
+    }
     const double d = fabs(mine - ref), rel = d / (fabs(ref) + 1e-6);
     c.max_abs = std::max(c.max_abs, d); c.max_rel = std::max(c.max_rel, rel);
     c.sum_abs += d; c.sum_ref += fabs(ref); c.n++;
@@ -654,4 +684,3 @@ static void frt_h_check_route(cudaStream_t stream, const float * fn, const int T
     frt_h_report("route-w", calls, c);
     if (id_bad) fprintf(stderr, "frt-href route-ids call %ld: %ld of %d slot ids differ from the double reference\n", calls, id_bad, T * n_used);
 }
-

@@ -27,8 +27,11 @@ patch series in `patches/`:
    and its compute buffers. The server sets a backend sampler per request
    (`--backend-sampling`), which used to reallocate every compute buffer
    before each prompt (`LLAMA_SCHED_RESERVE_NEW=1` restores that).
+9. Keep the scheduler while its node budget fits, growing with 25% headroom
+   (`LLAMA_SCHED_NODE_HEADROOM`). This covers per-request sampler-count
+   changes that patch 0008's exact budget match still reallocated for.
 
-Patches 3–8 change no values: every patch keeps logits bit-identical.
+Patches 3–9 change no values: every patch keeps logits bit-identical.
 
 `build.sh <work dir> [llama.cpp url or local clone]` reproduces the build
 from scratch: clone, fetch the PR head, check out the pin, `git am` the
@@ -37,17 +40,24 @@ Recommended serving flags and the runtime switches are in `../../USAGE.md`.
 
 ## Numerics
 
-The default path is exact: decode and prefill logits are bit-identical to
+The original M = 1 path and stock fallbacks are exact: with
+`GGML_FLASHRT_NO_BATCHED=1`, decode and prefill logits are bit-identical to
 stock llama.cpp at the same `-ub`, checked against the unmodified stock
 build with an FNV-1a hash of every position's logits: 1024 decode
 positions; 99,673 decode positions on a code corpus; 4096 decode positions
 with a 4096-ubatch context; 8192 prefill tokens at `-ub` 512, 2048, 4096,
 8192 and 3000 (a partial last ubatch); 512 prefill tokens at ubatches of
 2, 4, 8 and 32. Real-prompt greedy outputs are token-identical to stock. The opt-in decode attention
-(`FRT_ATTNDEC=1`) is the only non-bitwise component; its quality is gated
-against stock's own path variation (below).
+(`FRT_ATTNDEC=1`) is non-bitwise; its quality is gated against stock's own
+path variation (below). The default batched windows also change fp32
+summation order and use the sampled double-precision host-reference gate
+in `../../TESTING.md`.
 
 ## Measurements (RTX 5090, CUDA 13.0, f16 KV, `-fa on`, clocks not locked, GPU otherwise idle)
+
+The following tables record the original M = 1 implementation before the
+batched windows. They are historical reference measurements; current
+batched measurements and reproduction commands follow below.
 
 Stock = unmodified llama.cpp at the pin (default `-ub 512`); FlashRT =
 this host + overlay. Prefill and decode are reported separately; "served"
@@ -148,11 +158,63 @@ prompts are well-formed in all variants.
   would remove about 30% of an 8K prefill. That needs a MoE-specific
   grouped GEMM for ~100 tokens per expert; picking the MMQ tile from the
   per-expert token count was slower.
-- Batched decode: the decode windows are M = 1, so 2–8 concurrent
-  requests run mostly stock kernels. Aggregate decode at 2,048-token
-  prompts (`llama-batched-bench`, both `-ub 512`), batch 1 / 2 / 4 / 8:
-  stock 226 / 381 / 608 / 963 tok/s, FlashRT 514 / 481 / 769 / 1191.
 - Host time per decoded token (sampling, token round trip, graph launch)
   is not overlapped with the GPU: served decode with CPU sampling takes
   ~0.3 ms per token more than the GPU step. `--backend-sampling` removes
   most of the sampling share; the rest needs a GPU-resident decode loop.
+
+## Batched decode
+
+The default windows handle 2–128 tokens with int8 tensor-core dot products,
+expert grouping and multi-sequence decode attention (up to 32 sequences by
+default). Larger prefills and small MoE batches use stock kernels; the
+persistent and TMA ring variants are opt-in. See `../../USAGE.md` for caps,
+diagnostics and the one-active-context-per-GPU requirement.
+
+Review rerun on RTX 5090, CUDA 13.0, f16 KV, `-fa on`, 1,000 prompt tokens
+and 1,000 decode steps per sequence, default four CPU threads, two fresh
+processes (aggregate decode tok/s; median of two is their mean):
+
+| sequences | run 1 | run 2 | median |
+|---:|---:|---:|---:|
+| 1 | 520.24 | 518.00 | 519.12 |
+| 8 | 1463.63 | 1459.74 | 1461.69 |
+| 16 | 1659.80 | 1654.39 | 1657.10 |
+| 32 | 2104.19 | 2103.09 | 2103.64 |
+| 64 | 2482.22 | 2481.48 | 2481.85 |
+
+HTTP serving was checked separately with 64 concurrent requests, 128
+requests per round, 1,000 input and 1,000 output tokens, streaming sampled
+generation, f16 KV and `-c 131072 -np 64 -b 2048 -ub 512 -t 8`.
+With `--backend-sampling --samplers "top_k;top_p;min_p;temperature"
+--threads-http 16 --ctx-checkpoints 0`, two rounds completed all requests
+at 1459.97 and 1440.67 output tok/s. These are end-to-end rates, including
+prefill and HTTP overhead, rather than the batched-bench decode rate.
+
+Build from the pin with all nine patches, then run from the host checkout
+(`MODEL` is the official Flint NVFP4 GGUF and `TEXT` is the test corpus):
+
+```bash
+for ub in 8 24 64; do
+  GGML_CUDA_DISABLE_GRAPHS=1 FRT_B_HREF=1 ./build/bin/llama-perplexity \
+    -m "$MODEL" -ngl 99 -fa on -ctk f16 -ctv f16 -c 2048 --chunks 1 \
+    -b 2048 -ub "$ub" -f "$TEXT"
+done
+
+GGML_CUDA_DISABLE_GRAPHS=1 FRT_ATTNDEC_CHECK=8 FRT_ATTNDEC_CHECK_REF=vec \
+  FRT_B_ATTN_MAX_SEQ=64 ./build/bin/llama-batched-bench \
+    -m "$MODEL" -ngl 99 -fa on -ctk f16 -ctv f16 -c 131072 -b 2048 -ub 512 \
+    -npp 300 -ntg 32 -npl 8,64
+
+for rep in 1 2; do
+  ./build/bin/llama-batched-bench -m "$MODEL" -ngl 99 -fa on -ctk f16 -ctv f16 \
+    -c 131072 -b 2048 -ub 512 -npp 1000 -ntg 1000 -npl 1,8,16,32,64
+done
+```
+
+The review host-reference runs at ubatches 8/24/64 report `bad 0` for all
+sampled windows. Raw host/device q8 rounding differences are checked as
+documented in `../../TESTING.md`; batched output is not claimed bit-exact.
+The forced 64-sequence attention run also checks the kernel beyond its
+default sequence cap. Throughput is a benchmark result, separate from HTTP
+serving, where the sampling chain and context checkpoints affect the rate.

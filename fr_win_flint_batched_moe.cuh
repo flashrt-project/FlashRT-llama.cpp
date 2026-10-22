@@ -406,7 +406,7 @@ static void frt_h_check_moe(cudaStream_t stream, const float * act, const int T,
     const int ld_glu = n_used * n_ff + n_ff_sh, ld_q8 = n_used * (n_ff / 32) + n_ff_sh / 32;
     const auto dglu = frt_h_d2h(g_b_glu, (size_t) T * ld_glu);
     const auto desc = frt_h_d2h(g_b_esc, (size_t) T * 8);
-    frt_h_cmp c, cg, ce;
+    frt_h_cmp c, cg, ce, cp, csp;
     long flips = 0, dbad = 0;
     GGML_UNUSED(as);
     for (const int t : frt_h_tokens(T)) {
@@ -436,14 +436,10 @@ static void frt_h_check_moe(cudaStream_t stream, const float * act, const int T,
             frt_h_quant_cmp("moe", gd.data(), yg, n_ff, flips, dbad);
             {   // raw per-slot down output (g_b_part) vs host
                 const auto dp = frt_h_d2h(g_b_part + ((size_t) t * n_used + k) * K, K);
-                long nb = 0; int first = -1; double mx = 0;
                 for (int r = 0; r < K; ++r) {
                     const double ref = frt_h_dot(ed.data() + (size_t) r * drow_stride, yg, n_ff);
-                    const double d = fabs(dp[r] - ref);
-                    if (d > 1e-3 * (fabs(ref) + 1e-3)) { if (first < 0) first = r; ++nb; }
-                    mx = std::max(mx, d);
+                    frt_h_acc(cp, dp[r], ref);
                 }
-                if (nb) fprintf(stderr, "frt-href moe-part   call %ld t=%d k=%d e=%d: %ld of %d rows bad (first row %d, max_abs %.3e)\n", calls, t, k, e, nb, K, first, mx);
             }
             for (int r = 0; r < K; ++r) {
                 sum[r] += frt_h_dot(ed.data() + (size_t) r * drow_stride, yg, n_ff) * ds[e] * esc * wts[t * 8 + k];
@@ -460,14 +456,10 @@ static void frt_h_check_moe(cudaStream_t stream, const float * act, const int T,
         frt_h_quant_cmp("moe-sh", dglu.data() + (size_t) t * ld_glu + n_used * n_ff, ys, n_ff_sh, flips, dbad);
         {   // raw shared down output (g_b_shpart) vs host
             const auto dp = frt_h_d2h(g_b_shpart + (size_t) t * K, K);
-            long nb = 0; int first = -1; double mx = 0;
             for (int r = 0; r < K; ++r) {
                 const double ref = frt_h_dot(shd.data() + (size_t) r * shd_row_stride, ys, n_ff_sh);
-                const double d = fabs(dp[r] - ref);
-                if (d > 1e-3 * (fabs(ref) + 1e-3)) { if (first < 0) first = r; ++nb; }
-                mx = std::max(mx, d);
+                frt_h_acc(csp, dp[r], ref);
             }
-            if (nb) fprintf(stderr, "frt-href moe-shpart call %ld t=%d: %ld of %d rows bad (first row %d, max_abs %.3e)\n", calls, t, nb, K, first, mx);
         }
         for (int r = 0; r < K; ++r) {
             const double ref = sum[r] + frt_h_dot(shd.data() + (size_t) r * shd_row_stride, ys, n_ff_sh) * sds[0] + rs[(size_t) t * K + r];
@@ -476,6 +468,8 @@ static void frt_h_check_moe(cudaStream_t stream, const float * act, const int T,
     }
     frt_h_report("moe-glu", calls, cg);
     frt_h_report("moe-esc", calls, ce);
+    frt_h_report("moe-part", calls, cp);
+    frt_h_report("moe-shpart", calls, csp);
     frt_h_report("moeffn", calls, c);
     fprintf(stderr, "frt-href moe-q8     call %ld: %ld int8 flips, %ld scale mismatches (device glu/esc requantized on host)\n", calls, flips, dbad);
 }

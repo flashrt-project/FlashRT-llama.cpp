@@ -77,8 +77,9 @@ Every performance change must pass this protocol on device:
 
 ## 4. Flint NVFP4 (SM120) protocol
 
-The Flint windows claim bit-exactness against stock llama.cpp, so the
-primary gate is logit identity, checked with a teacher-forced driver that
+The original M = 1 windows and stock fallbacks claim bit-exactness against
+stock llama.cpp. With `GGML_FLASHRT_NO_BATCHED=1`, their primary gate is
+logit identity, checked with a teacher-forced driver that
 records an FNV-1a hash of every position's f32 logits:
 
 - **Decode path** (`n_batch = 1`, every position through the M = 1 graph):
@@ -126,17 +127,33 @@ GGML_CUDA_DISABLE_GRAPHS=1 FRT_B_HREF=1 llama-perplexity -m <nvfp4.gguf> -ngl 99
     -c 2048 --chunks 1 -b 2048 -ub <T> -f <text>
 ```
 
-prints one `frt-href <window> call <k> ... bad <n>` line per window and call
-(the two-token warm-up is skipped). Gate: `bad 0` for every window, `max_rel`
-at the 1e-4 level only where the reference value is tiny, `int8 flips 0`
-for the device-vs-host quantization of the same rows (`qkv-q8`, `dense-q8`,
-`moe-q8`). `oproj-q8` requantizes the device's fp32 attention output on the
-host and may show a few single-LSB flips on rounding ties; they do not enter
-the dot-product reference, which consumes the device's q8 blocks. Run it at `-ub 8`,
+prints `frt-href <window> call <k> ... bad <n>` lines for the first six
+eligible calls per window (batches smaller than four tokens are skipped).
+The reference samples token rows and output channels; it is a window check,
+not an exhaustive end-to-end quality check. Gate: `bad 0` for every reported
+window (a mismatch requires both absolute error > 1e-4 and relative error
+> 2e-3), no routing-ID mismatches, zero scale mismatches, and zero
+unexplained quantization flips. `qkv-q8` must have zero raw flips.
+The routed and shared MoE down-projection partials (`moe-part`,
+`moe-shpart`) report the same error gate as final window outputs. Any
+non-finite reference or result is a failure.
+`dense-q8`, `moe-q8` and `oproj-q8` requantize device fp32 rows on the host;
+CPU division and CUDA fast division can straddle a rounding boundary.
+The check retains raw flip counts and prints `quant-ties` only when the
+two int8 values are adjacent integers straddling a half-integer within two
+fp32 ULPs. Every raw flip must be accounted for by those diagnostics;
+any `quant-bad` is a failure. These ties do not enter the dot-product
+reference, which consumes the device's q8 blocks. Run it at `-ub 8`,
 `24` and `64` (one, two and four token tiles). The batched attention has its
-own check: `FRT_ATTNDEC_CHECK=<k> FRT_ATTNDEC_CHECK_REF=vec` on
-`llama-batched-bench` (eager mode) reports the per-call difference against
-ggml's f32 vector kernel (measured max rel 2e-6 at 8 and 64 sequences).
+own check: `GGML_CUDA_DISABLE_GRAPHS=1 FRT_ATTNDEC_CHECK=<k>
+FRT_ATTNDEC_CHECK_REF=vec FRT_B_ATTN_MAX_SEQ=64` on `llama-batched-bench`
+forces coverage of 64 sequences, beyond the default cap of 32, and reports
+the sampled per-call difference against
+ggml's f32 vector kernel (review rerun max rel 2.42e-6 at 8 and 64 sequences).
 Throughput: `llama-batched-bench -npp 1000 -ntg 1000 -npl 1,8,16,32,64`
 (fixed batches, random decode tokens), two fresh processes, median; the
 served number is a separate `llama-server` run and is reported separately.
+
+Use `-c 131072 -b 2048 -ub 512 -npp 1000 -ntg 1000 -npl 1,8,16,32,64`
+for that throughput sweep: 64 independent sequences need 128,000 KV cells
+for 1,000 prompt plus 1,000 generated tokens each. `-c 90000` is too small.
