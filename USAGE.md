@@ -180,6 +180,37 @@ full-attention layers on an f16 tensor-core kernel instead (GQA ratio >
 | `FRT_PF_CHECK=1` | test aid: the prefill MoE tail window compares against ggml's own execution (eager mode) |
 | `FRT_STATS=1`, `FRT_DUMP_GRAPH=1` + `FRT_DUMP_M=<m>` (+ `FRT_DUMP_PATH`) | diagnostics |
 
+### Batched decode (2 to 128 tokens per ubatch)
+
+The decode windows also take ubatches of 2..128 tokens (several sequences
+decoding together, or a short prompt): weight rows are read once per kernel
+and applied to all tokens with `mma.sync.m16n8k16.s8` (one MMA per 16-value
+NVFP4 sub-block: the integer dot products are exact, the UE4M3 and q8_1
+scales are applied in fp32), the routed experts are grouped by the top-k
+selection, and the decode attention runs over the sequences (per-sequence KV
+slots, i.e. without `-kvu`). Each token is computed with the same per-element
+arithmetic as the M = 1 windows; only the fp32 summation order differs, so
+batched outputs are gated by the host reference in TESTING.md, not by bits.
+Defaults were measured on an RTX 5090 with 1000-token prompts.
+
+| variable | effect |
+|---|---|
+| `GGML_FLASHRT_NO_BATCHED=1` | stock kernels for every ubatch of more than one token |
+| `FRT_B_MOE_MIN_T=<t>` (9), `FRT_B_MOE_MAX_T=<t>` (128) | token range of the batched routing / MoE windows; below it stock's per-slot MMVQ is faster, above it stock MMQ (prompt-sized ubatches) |
+| `FRT_B_ATTN=0`, `FRT_B_ATTN_MAX_SEQ=<n>` (32) | batched decode attention off / its sequence cap (stock's f16 tensor-core kernel is faster at 64 x 1K rows); `FRT_B_ATTN_CTAS`, `FRT_B_ATTN_NS` tune chunking |
+| `FRT_B_DP4A=1`, `FRT_S_OFF=1`, `FRT_S_DN=1`, `FRT_P_ON=1`, `FRT_T_ON=1` | kernel variants: CUDA-core dp4a; gate/up back to the register-resident kernel; down with the shared-memory kernel; persistent ring; TMA bulk ring (all slower than the defaults, kept for study) |
+| `FRT_B_HREF=1` | test aid (with `GGML_CUDA_DISABLE_GRAPHS=1`): every batched window is checked against a double-precision host reference, see TESTING.md |
+| `FRT_B_CHECK=1` | test aid: batched windows compute into private buffers and are compared against ggml's own execution |
+| `FRT_B_DBG=<bits>` | timing aid: 1 skips the MMAs, 2 the token staging, 4 the weight loads (outputs are wrong) |
+
+Server flags that matter for batched decode (measured, no output change):
+per-sequence KV slots (no `-kvu`), `--backend-sampling` with
+`--samplers "top_k;top_p;min_p;temperature"` (a chain every sampler of which
+has a backend implementation), `--ctx-checkpoints 0` (the default
+checkpoints copy the SWA cache rows to host at every request boundary),
+`--threads-http 16`. `-ub` above 512 does not fit 64 slots: the SWA cache is
+sized slots x (513 + n_ubatch).
+
 The windows' scratch buffers belong to one GPU (the first SM120 device
 that runs a graph; any other device runs stock) and to one active context:
 run one Flint context per GPU at a time (one `llama-server` process with
@@ -195,6 +226,7 @@ identical results either way):
 | `GGML_CUDA_FA_KV_MIN=0` | no masked-tile skipping in the tensor-core FA kernel |
 | `LLAMA_KQ_MASK_SERIAL=1` | serial KQ-mask fill |
 | `LLAMA_SCHED_RESERVE_NEW=1` | recreate the scheduler (and its compute buffers) on every re-reserve |
+| `LLAMA_SCHED_NODE_HEADROOM=<f>` | patch 0009: the scheduler is recreated only when the node budget grows, with this headroom (default 0.25); the budget moves with the number of per-sequence backend samplers |
 | build with `GGML_CUDA_FA_VEC_NO_MASKED_SKIP` | no masked-warp skipping in the vector FA kernel |
 
 `--backend-sampling` (stock option) samples on the GPU: served decode is

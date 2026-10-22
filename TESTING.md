@@ -113,3 +113,27 @@ and speed-neutral by construction. `FRT_STATS=1` also reports whether the
 MoE window reuses the router window's quantized activation
 (`moeffn ... act_q8=1`); a host change that breaks that handoff stays
 exact but loses speed, so it is part of the check.
+
+### Batched decode windows (2..128 tokens)
+
+Batched outputs are not bit-identical to the M = 1 windows (fp32 summation
+order), so they are gated against a double-precision host reference that
+re-derives every window from the device's own q8_1 blocks (NVFP4 x q8_1 dot
+products exactly as ggml defines them):
+
+```
+GGML_CUDA_DISABLE_GRAPHS=1 FRT_B_HREF=1 llama-perplexity -m <nvfp4.gguf> -ngl 99 -fa on -ctk f16 -ctv f16 \
+    -c 2048 --chunks 1 -b 2048 -ub <T> -f <text>
+```
+
+prints one `frt-href <window> call <k> ... bad <n>` line per window and call
+(the two-token warm-up is skipped). Gate: `bad 0` for every window, `max_rel`
+at the 1e-4 level only where the reference value is tiny, `int8 flips 0`
+for the device-vs-host quantization of the same rows. Run it at `-ub 8`,
+`24` and `64` (one, two and four token tiles). The batched attention has its
+own check: `FRT_ATTNDEC_CHECK=<k> FRT_ATTNDEC_CHECK_REF=vec` on
+`llama-batched-bench` (eager mode) reports the per-call difference against
+ggml's f32 vector kernel (measured max rel 2e-6 at 8 and 64 sequences).
+Throughput: `llama-batched-bench -npp 1000 -ntg 1000 -npl 1,8,16,32,64`
+(fixed batches, random decode tokens), two fresh processes, median; the
+served number is a separate `llama-server` run and is reported separately.

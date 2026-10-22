@@ -983,26 +983,13 @@ static void frt_t_moe_launch(const frt_b_moe_args & a, const frt_t_item * items,
             const int e = (x >> 3) & 0xF, m = x & 7;
             lut[i] = (e == 0 ? ldexpf((float) m, -9) : ldexpf(1.0f + (float) m / 8.0f, e - 7)) / 2;
         }
-        cudaError_t e0 = cudaGetLastError();
-        if (e0 != cudaSuccess) fprintf(stderr, "frt_t: sticky error before init: %s\n", cudaGetErrorString(e0));
         CUDA_CHECK(cudaMemcpyToSymbol(frt_t_ue4m3_lut, lut, sizeof(lut)));
         CUDA_CHECK(cudaFuncSetAttribute(frt_t_moe<GLU>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         int dev; CUDA_CHECK(cudaGetDevice(&dev));
         CUDA_CHECK(cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev));
-        cudaFuncAttributes fa; CUDA_CHECK(cudaFuncGetAttributes(&fa, frt_t_moe<GLU>));
-        fprintf(stderr, "frt_t<%d>: regs %d local %zu smem static %zu max dyn %d n_sm %d\n", (int) GLU, fa.numRegs, fa.localSizeBytes, fa.sharedSizeBytes, fa.maxDynamicSharedSizeBytes, n_sm);
         attr = true;
     }
-    static const bool plain = getenv("FRT_T_PLAIN") && getenv("FRT_T_PLAIN")[0] == '1';
-    if (plain) {
-        size_t mfree = 0, mtot = 0; cudaMemGetInfo(&mfree, &mtot);
-        fprintf(stderr, "frt_t<%d>: free %zu MiB of %zu before launch\n", (int) GLU, mfree >> 20, mtot >> 20);
-        frt_t_moe<GLU><<<(dim3) n_sm, (dim3) (FRT_T_NW * WARP_SIZE), smem, stream>>>(a, items, tbl_n, gr, gs);
-        const cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) fprintf(stderr, "frt_t<%d>: plain launch error %s (grid %d smem %zu T %d)\n", (int) GLU, cudaGetErrorString(e), n_sm, smem, a.T);
-    } else {
-        ggml_cuda_kernel_launch(frt_t_moe<GLU>, ggml_cuda_kernel_launch_params((dim3) n_sm, (dim3) (FRT_T_NW * WARP_SIZE), smem, stream), a, items, tbl_n, gr, gs);
-    }
+    ggml_cuda_kernel_launch(frt_t_moe<GLU>, ggml_cuda_kernel_launch_params((dim3) n_sm, (dim3) (FRT_T_NW * WARP_SIZE), smem, stream), a, items, tbl_n, gr, gs);
 }
 
 // ---- per-tile MoE kernel with weights staged in shared memory --------------------------
