@@ -36,6 +36,8 @@ static int32_t      * g_b_eoff   = nullptr;  // [257] expert -> first slot in g_
 static int32_t      * g_b_slots  = nullptr;  // [T*8] slot ids (t * 8 + k) grouped by expert
 static int32_t      * g_b_act    = nullptr;  // [258] active experts (count at [256])
 static unsigned int * g_b_done   = nullptr;  // top-k CTA completion counter
+static void         * g_b_items  = nullptr;  // [1024] frt_t_item work table (shared token tiles, then routed)
+static int32_t      * g_b_tbln   = nullptr;  // [2] entries: shared, routed
 static float        * g_b_part   = nullptr;  // [T][n_used][2048] routed down outputs (unscaled)
 static float        * g_b_shpart = nullptr;  // [T][2048] shared-expert down output (unscaled)
 
@@ -110,6 +112,8 @@ static void frt_b_alloc() {
     CUDA_CHECK(cudaMalloc(&g_b_act, 258 * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&g_b_done, sizeof(unsigned int)));
     CUDA_CHECK(cudaMemset(g_b_done, 0, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&g_b_items, 1024 * 3 * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&g_b_tbln, 2 * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&g_b_part, T * 8 * 2048 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&g_b_shpart, T * 2048 * sizeof(float)));
 }

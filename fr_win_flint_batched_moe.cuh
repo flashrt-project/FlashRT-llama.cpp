@@ -75,7 +75,8 @@ static __global__ void __launch_bounds__(256) frt_b_router(const float * xn, con
 // (slot = t * 8 + k), act[0 .. n_active) lists the experts with tokens.
 static __global__ void __launch_bounds__(256) frt_b_topk_group(const float * logits, const int T, const int n_used, const float clamp_val,
         int32_t * ids_out, const int64_t ids_stride, float * w_out, const int64_t w_stride,
-        int32_t * ids_snap, float * w_snap, int32_t * eoff, int32_t * slots, int32_t * act, unsigned int * done) {
+        int32_t * ids_snap, float * w_snap, int32_t * eoff, int32_t * slots, int32_t * act, unsigned int * done,
+        frt_t_item * items, int32_t * tbl_n) {
     ggml_cuda_pdl_lc();
     __shared__ int cnt[256], cur[256], wsum[8];
     __shared__ int n_act;
@@ -134,6 +135,33 @@ static __global__ void __launch_bounds__(256) frt_b_topk_group(const float * log
         const int tt = s / n_used, k = s % n_used;
         const int pos = atomicAdd(&cur[__ldcg(ids_snap + tt * 8 + k)], 1);
         slots[pos] = tt * 8 + k;
+    }
+    // work table for the bulk MoE kernel: shared-expert token tiles, then (active expert, token tile) entries
+    {
+        constexpr int TT = FRT_T_TT;
+        const int n_sh = (T + TT - 1) / TT;
+        if (tid < n_sh) items[tid] = { -1, tid * TT, min(TT, T - tid * TT) };
+        // per active expert: ceil(cnt / TT) entries; prefix over the active list (<= 256) by one warp
+        __shared__ int ent[256];
+        if (tid < 256) ent[tid] = tid < n_act ? (cnt[act[tid]] + TT - 1) / TT : 0;   // cnt[] still holds the counts
+        __syncthreads();
+        int v = ent[tid];
+        int inc = v;
+#pragma unroll
+        for (int d = 1; d < WARP_SIZE; d <<= 1) { const int o = __shfl_up_sync(0xffffffff, inc, d); if (lane >= d) inc += o; }
+        __shared__ int wsum2[8];
+        if (lane == WARP_SIZE - 1) wsum2[warp] = inc;
+        __syncthreads();
+        int base2 = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) if (w < warp) base2 += wsum2[w];
+        const int excl2 = base2 + inc - v;
+        if (tid < n_act) {
+            const int e = act[tid];
+            const int c0 = eoff[e], ccnt = cnt[e];
+            for (int j = 0; j < v; ++j) items[n_sh + excl2 + j] = { e, c0 + j * TT, min(TT, ccnt - j * TT) };
+        }
+        if (tid == 255) { tbl_n[0] = n_sh; tbl_n[1] = excl2 + v; }
     }
 }
 
@@ -406,6 +434,17 @@ static void frt_h_check_moe(cudaStream_t stream, const float * act, const int T,
             for (int r = 0; r < n_ff; ++r) gd[r] = dglu[(size_t) t * ld_glu + k * n_ff + r] / esc;
             frt_h_q8 yg; frt_h_q8_from_dev(g_b_gluq8 + (size_t) t * ld_q8 + k * (n_ff / 32), n_ff, yg);
             frt_h_quant_cmp("moe", gd.data(), yg, n_ff, flips, dbad);
+            {   // raw per-slot down output (g_b_part) vs host
+                const auto dp = frt_h_d2h(g_b_part + ((size_t) t * n_used + k) * K, K);
+                long nb = 0; int first = -1; double mx = 0;
+                for (int r = 0; r < K; ++r) {
+                    const double ref = frt_h_dot(ed.data() + (size_t) r * drow_stride, yg, n_ff);
+                    const double d = fabs(dp[r] - ref);
+                    if (d > 1e-3 * (fabs(ref) + 1e-3)) { if (first < 0) first = r; ++nb; }
+                    mx = std::max(mx, d);
+                }
+                if (nb) fprintf(stderr, "frt-href moe-part   call %ld t=%d k=%d e=%d: %ld of %d rows bad (first row %d, max_abs %.3e)\n", calls, t, k, e, nb, K, first, mx);
+            }
             for (int r = 0; r < K; ++r) {
                 sum[r] += frt_h_dot(ed.data() + (size_t) r * drow_stride, yg, n_ff) * ds[e] * esc * wts[t * 8 + k];
             }
@@ -419,6 +458,17 @@ static void frt_h_check_moe(cudaStream_t stream, const float * act, const int T,
         }
         frt_h_q8 ys; frt_h_q8_from_dev(g_b_gluq8 + (size_t) t * ld_q8 + n_used * (n_ff / 32), n_ff_sh, ys);
         frt_h_quant_cmp("moe-sh", dglu.data() + (size_t) t * ld_glu + n_used * n_ff, ys, n_ff_sh, flips, dbad);
+        {   // raw shared down output (g_b_shpart) vs host
+            const auto dp = frt_h_d2h(g_b_shpart + (size_t) t * K, K);
+            long nb = 0; int first = -1; double mx = 0;
+            for (int r = 0; r < K; ++r) {
+                const double ref = frt_h_dot(shd.data() + (size_t) r * shd_row_stride, ys, n_ff_sh);
+                const double d = fabs(dp[r] - ref);
+                if (d > 1e-3 * (fabs(ref) + 1e-3)) { if (first < 0) first = r; ++nb; }
+                mx = std::max(mx, d);
+            }
+            if (nb) fprintf(stderr, "frt-href moe-shpart call %ld t=%d: %ld of %d rows bad (first row %d, max_abs %.3e)\n", calls, t, nb, K, first, mx);
+        }
         for (int r = 0; r < K; ++r) {
             const double ref = sum[r] + frt_h_dot(shd.data() + (size_t) r * shd_row_stride, ys, n_ff_sh) * sds[0] + rs[(size_t) t * K + r];
             frt_h_acc(c, os[(size_t) t * K + r], ref);

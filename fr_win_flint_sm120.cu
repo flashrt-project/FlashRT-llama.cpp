@@ -1851,7 +1851,7 @@ static bool frt_b_route_launch(ggml_backend_cuda_context & ctx, const frt_route_
     ggml_cuda_kernel_launch(frt_b_topk_group, ggml_cuda_kernel_launch_params((dim3) ((m.T + 7) / 8), (dim3) 256, 0, stream),
         (const float *) g_b_logits, m.T, m.n_used, m.clamp_val,
         (int32_t *) m.as->data, (int64_t) (m.as->nb[1] / sizeof(int32_t)), chk ? chk : (float *) m.dv->data, (int64_t) m.n_used,
-        g_b_ids, g_b_wts, g_b_eoff, g_b_slots, g_b_act, g_b_done);
+        g_b_ids, g_b_wts, g_b_eoff, g_b_slots, g_b_act, g_b_done, (frt_t_item *) g_b_items, g_b_tbln);
     if (chk) return false;
     if (frt_h_check_on()) frt_h_check_route(stream, (const float *) m.fn->data, m.T, (const nv_bfloat16 *) m.wr->data, (int64_t) (m.wr->nb[1] / sizeof(nv_bfloat16)),
         m.n_used, m.clamp_val, (const int32_t *) m.as->data, (int64_t) (m.as->nb[1] / sizeof(int32_t)), (const float *) m.dv->data);
@@ -2275,7 +2275,16 @@ static bool frt_b_moeffn_launch(ggml_backend_cuda_context & ctx, const frt_moeff
         a.n_rows = m.n_ff; a.sh_rows = m.n_ff_sh; a.T = T; a.n_used = n_used;
         a.tiles_r = (m.n_ff + NW * RPW - 1) / (NW * RPW); a.fzero = 0.0f; a.dbg = dbg;
         static const bool persist = getenv("FRT_P_ON") && getenv("FRT_P_ON")[0] == '1';
-        if (!frt_b_dp4a() && persist) {
+        static const bool bulk = (getenv("FRT_T_ON") && getenv("FRT_T_ON")[0] == '1');
+        static const bool smw = !(getenv("FRT_S_OFF") && getenv("FRT_S_OFF")[0] == '1');
+        if (!frt_b_dp4a() && smw) {
+            a.tiles_r = (m.n_ff + FRT_M_ROWS - 1) / FRT_M_ROWS;
+            frt_s_moe_launch<FRT_K_EMBD / 64, FRT_K_EMBD / 64, true>(a, n_act_max, stream);
+        } else if (!frt_b_dp4a() && bulk) {
+            a.tiles_r = (m.n_ff + FRT_M_ROWS - 1) / FRT_M_ROWS;   // RT = 1
+            const frt_t_geom gr = { FRT_K_EMBD / 64, 1, 1168, 592 }, gs = { FRT_K_EMBD / 64, 1, 1168, 592 };
+            frt_t_moe_launch<true>(a, (const frt_t_item *) g_b_items, g_b_tbln, gr, gs, stream);
+        } else if (!frt_b_dp4a() && persist) {
             a.tiles_r = (m.n_ff + FRT_M_ROWS - 1) / FRT_M_ROWS;   // RT = 1
             const frt_p_geom gr = { FRT_K_EMBD / 64, 1, 1168 }, gs = { FRT_K_EMBD / 64, 1, 1168 };
             frt_p_moe_launch<true>(a, gr, gs, stream);
@@ -2305,7 +2314,16 @@ static bool frt_b_moeffn_launch(ggml_backend_cuda_context & ctx, const frt_moeff
         a.n_rows = m.K; a.sh_rows = m.K; a.T = T; a.n_used = n_used;
         a.tiles_r = (m.K + NW * RPW - 1) / (NW * RPW); a.fzero = 0.0f; a.dbg = dbg;
         static const bool persist = getenv("FRT_P_ON") && getenv("FRT_P_ON")[0] == '1';
-        if (!frt_b_dp4a() && persist) {
+        static const bool bulk = (getenv("FRT_T_ON") && getenv("FRT_T_ON")[0] == '1');
+        static const bool smw = (getenv("FRT_S_DN") && getenv("FRT_S_DN")[0] == '1');
+        if (!frt_b_dp4a() && smw) {
+            a.tiles_r = (m.K + FRT_M_ROWS - 1) / FRT_M_ROWS;
+            frt_s_moe_launch<512 / 64, 1024 / 64, false>(a, n_act_max, stream);
+        } else if (!frt_b_dp4a() && bulk) {
+            a.tiles_r = (m.K + 64 - 1) / 64;   // RT = 4 (64 rows per item, K = 512); shared RT = 2 (K = 1024)
+            const frt_t_geom gr = { 512 / 64, 4, 304, 208 }, gs = { 1024 / 64, 2, 592, 336 };   // token half rows: 288 + 16 / 576 + 16
+            frt_t_moe_launch<false>(a, (const frt_t_item *) g_b_items, g_b_tbln, gr, gs, stream);
+        } else if (!frt_b_dp4a() && persist) {
             a.tiles_r = (m.K + 64 - 1) / 64;   // RT = 4 (64 rows per item, K = 512); shared RT = 2 (K = 1024)
             const frt_p_geom gr = { 512 / 64, 4, 288 + 16 }, gs = { 1024 / 64, 2, 576 + 16 };
             frt_p_moe_launch<false>(a, gr, gs, stream);
@@ -2374,6 +2392,8 @@ static bool frt_moeffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     const bool act_q8 = act_src == g_act_q8_src && m.act->data == act_src->data;   // ROUTE published q8_1(act) for this layer
     g_act_q8_src = nullptr;
     if (m.T > 1) {
+        static const int min_t = getenv("FRT_B_MOE_MIN_T") ? atoi(getenv("FRT_B_MOE_MIN_T")) : 9;
+        if (m.T < min_t) return false;   // stock's per-slot MMVQ streams small batches faster (T <= 8)
         if (!act_q8) return false;   // the batched span needs ROUTE's q8 activation and expert grouping
         if (m.n_ff_sh != 1024 || m.K % 256 != 0) return false;
         if (!frt_b_moeffn_launch(ctx, m, i)) return false;
