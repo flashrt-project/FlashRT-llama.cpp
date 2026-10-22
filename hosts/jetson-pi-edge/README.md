@@ -33,4 +33,4 @@ at an overlay checkout instead of a FlashRT checkout.
 Status: the patch is a path-only rewrite of the block that was building
 on 2026-08-25 and has not been rebuilt on a Thor since the move; the
 first build on device is the acceptance run (qualification gates in
-`../../qualification/`, TESTING.md protocol).
+`../../qualification/`, [testing protocol](../../docs/testing.md)).

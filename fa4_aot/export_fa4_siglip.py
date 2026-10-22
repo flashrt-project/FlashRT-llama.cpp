@@ -15,7 +15,10 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 # The FA4 source is FlashRT's vendored CuTe-DSL forward; point FLASHRT_DIR
 # at a FlashRT checkout to regenerate the AOT modules.
-_REPO = Path(os.environ.get("FLASHRT_DIR", _HERE.parents[2]))
+_flashrt_dir = os.environ.get("FLASHRT_DIR")
+if not _flashrt_dir:
+    raise SystemExit("Set FLASHRT_DIR to a FlashRT source checkout before regenerating FA4 modules.")
+_REPO = Path(_flashrt_dir).resolve()
 sys.path.insert(0, str(_REPO))
 
 import torch  # noqa: E402

@@ -22,4 +22,4 @@ series, resolve, `git format-patch` back into `patches/`, update `PIN`,
 re-run the qualification gates (`../../qualification/`).
 
 Runtime: `GGML_CUDA_FLASHRT_DISABLE=1` reproduces stock; the per-window
-switches are documented in `../../USAGE.md`.
+switches are documented in `../../docs/usage.md`.

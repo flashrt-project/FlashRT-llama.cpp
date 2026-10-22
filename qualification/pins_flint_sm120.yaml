@@ -1,0 +1,48 @@
+# SM120 / Recursive Flint (official NVFP4 GGUF) target: the windows in
+# fr_win_flint_sm120.cu reproduce ggml's own per-element arithmetic, so they
+# use no catalog structures; what is pinned are the model and graph shapes
+# their predicates assert (a window whose predicate fails runs stock).
+binding: llamacpp_flint_sm120
+pins: {}
+
+model_shapes:            # asserted at match time
+  n_embd: 2048
+  n_layer: 49            # layers 0-1 dense (n_ff 6144), 2-48 MoE
+  attention: {n_head: 32, n_head_kv: 4, head_dim: 128, sliding_window: 513, qk_norm: true, sinks: true,
+              rope: sliding_layers_only}
+  moe: {n_expert: 256, n_expert_used: 6, gating: sigmoid, expert_ff: 512, shared_expert_ff: 1024, shared_gated: false,
+        activation_rescale: amax_pow2_chain}
+  weights: nvfp4          # per-tensor f32 scale nodes after every NVFP4 matmul
+  router: bf16
+  kv_cache: f16
+  prefill_window_ubatch_max: 8192
+
+# Original M = 1 / stock-fallback measurements (GGML_FLASHRT_NO_BATCHED=1).
+# RTX 5090, host PIN in hosts/llama.cpp-flint, 2026-10-21.
+# Current batched windows use the separate sampled host-reference gate below.
+gates:
+  quality:
+    decode_logits_vs_stock: bit_identical       # teacher-forced n_batch 1: 1024 positions (mixed text),
+                                                # 99,673 positions (code corpus), 4096 positions with -ub 4096
+    prefill_logits_vs_stock: bit_identical      # 8192 tokens at -ub 512/2048/4096/8192/3000 (partial last
+                                                # ubatch); 512 tokens at ubatches of 2/4/8/32
+    real_suite_tokens_vs_stock: identical       # 8 coding/agent prompts, 512 greedy tokens
+    route_moe_handoff: "FRT_STATS=1 reports moeffn act_q8=1"
+    batched_host_reference:
+      command_env: "GGML_CUDA_DISABLE_GRAPHS=1 FRT_B_HREF=1"
+      ubatches: [8, 24, 64]
+      coverage: "first six eligible calls, sampled tokens and output channels"
+      bad: 0
+      mismatch_thresholds: {absolute: 1.0e-4, relative: 2.0e-3, require_both: true}
+      quantization: "zero scale/unexplained mismatches; qkv-q8 zero raw flips; other raw flips require quant-ties diagnostics"
+    attndec_opt_in:                             # per-call max relative difference to ggml's kernel for the node
+      vs_vec_f32_nkv_lt_8192: {median: 4.8e-7, max: 4.3e-6}
+      vs_vec_f32_nkv_ge_8192: {median: 5.6e-7, max: 4.1e-6}   # FRT_ATTNDEC_CHECK_REF=vec
+      vs_stock_mma_f16_nkv_ge_8192: {median: 5.6e-4, max: 4.2e-3}   # stock's kernel there rounds Q, P to f16
+      kld_code_c2048: 0.236
+      stock_path_kld_reference: 0.239
+  perf:                  # llama-bench, f16 KV, -fa on; d100k = median of 3 fresh processes
+    tg128_d0: 550.1
+    tg128_d100k: 264.9
+    pp8192_ub4096: 16419
+    stock_reference: {tg128_d0: 242.1, tg128_d100k: 162.0, pp8192_ub512: 7219, pp8192_ub4096: 11990}

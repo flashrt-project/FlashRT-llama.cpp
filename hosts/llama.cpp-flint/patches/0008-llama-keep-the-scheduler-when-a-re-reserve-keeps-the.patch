@@ -1,0 +1,71 @@
+From 6f2b6f50bb23976f5d11d6213822941d54247a89 Mon Sep 17 00:00:00 2001
+From: LiangSu8899 <7thuniversels@gmail.com>
+Date: Wed, 21 Oct 2026 21:47:25 -0400
+Subject: [PATCH 8/8] llama: keep the scheduler when a re-reserve keeps the
+ node budget
+
+sched_reserve() recreated the backend scheduler on every call, freeing and
+reallocating all compute buffers. Setting a backend sampler marks the
+context for a re-reserve, and the server sets one per request, so with
+--backend-sampling every request paid a full compute-buffer reallocation
+(~130 ms at -ub 4096 on an RTX 5090) before its prompt. When the node
+budget and pipeline parallelism are unchanged the existing scheduler is
+now reused: ggml-alloc only reallocates a buffer when the new worst case
+needs more memory. LLAMA_SCHED_RESERVE_NEW=1 restores the old behaviour.
+
+---
+ src/llama-context.cpp | 15 ++++++++++++++-
+ src/llama-context.h   |  4 ++++
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..c0dabcd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -710,6 +710,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+ 
+     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
++
++    sched_max_nodes = max_nodes;
++    sched_parallel  = parallel;
+ }
+ 
+ void llama_context::sched_reserve() {
+@@ -738,7 +741,17 @@ void llama_context::sched_reserve() {
+     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+     gf_res_prev_active = nullptr;
+ 
+-    sched_new(max_nodes, cparams.pipeline_parallel);
++    // a re-reserve with an unchanged node budget (e.g. a backend sampler set for a new
++    // request) keeps the scheduler: its compute buffers are only reallocated if the
++    // new worst case needs more memory. LLAMA_SCHED_RESERVE_NEW=1 always recreates it.
++    static const bool always_new = [] {
++        const char * env = getenv("LLAMA_SCHED_RESERVE_NEW");
++        return env && atoi(env) != 0;
++    }();
++    if (always_new || !sched || model.hparams.no_alloc ||
++        sched_max_nodes != max_nodes || sched_parallel != cparams.pipeline_parallel) {
++        sched_new(max_nodes, cparams.pipeline_parallel);
++    }
+ 
+     llama_memory_context_ptr mctx;
+     if (memory) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..e1f25d3 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -366,6 +366,10 @@ private:
+ 
+     ggml_backend_sched_ptr sched;
+ 
++    // node budget and pipeline parallelism the current sched was created with
++    size_t sched_max_nodes = 0;
++    bool   sched_parallel  = false;
++
+     bool sched_need_reserve = true;
+ 
+     // whether the reserve graph has a logits tensor, set in sched_reserve()
+-- 
+2.43.0
+

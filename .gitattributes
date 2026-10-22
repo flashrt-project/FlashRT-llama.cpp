@@ -1,0 +1,2 @@
+# Mailbox patches contain required blank context lines and a signature marker.
+*.patch whitespace=-blank-at-eol,-blank-at-eof

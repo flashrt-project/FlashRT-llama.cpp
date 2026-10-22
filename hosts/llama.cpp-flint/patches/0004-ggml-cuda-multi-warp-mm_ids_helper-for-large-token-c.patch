@@ -1,0 +1,138 @@
+From f2c1e005751401c1dcec62d87a4a8ae11a4aa11a Mon Sep 17 00:00:00 2001
+From: LiangSu8899 <7thuniversels@gmail.com>
+Date: Wed, 21 Oct 2026 19:51:24 -0400
+Subject: [PATCH 4/8] ggml-cuda: multi-warp mm_ids_helper for large token
+ counts
+
+One warp per expert scanned every token slot serially (66 us per call at
+2048 tokens x 6 slots, three calls per MoE layer). With >= 256 tokens, 16
+warps per expert scan contiguous token chunks and prefix-sum their counts,
+producing identical ids_src1 / ids_dst / expert_bounds (entries per expert
+in ascending token order). GGML_CUDA_MMID_SINGLE_WARP=1 keeps the old kernel.
+Prefill logits bit-identical (8192 tokens, ubatch 2048); pp8192 +5%.
+
+---
+ ggml/src/ggml-cuda/mmid.cu | 100 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 100 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmid.cu b/ggml/src/ggml-cuda/mmid.cu
+index 12ae14c..a8ae668 100644
+--- a/ggml/src/ggml-cuda/mmid.cu
++++ b/ggml/src/ggml-cuda/mmid.cu
+@@ -127,6 +127,92 @@ static __global__ void mm_ids_helper(
+     expert_bounds[gridDim.x] = nex_prev + it_compact;
+ }
+ 
++// Same outputs as mm_ids_helper (entries per expert in ascending token order), but
++// NW warps per expert: warp w scans a contiguous token chunk, then the per-warp
++// counts are prefix-summed so each warp writes its entries at the right offset.
++// The single-warp scan over all token slots dominated MoE prefill at large ubatches.
++template <int n_expert_used_template, int nwarps>
++__launch_bounds__(nwarps*WARP_SIZE, 1)
++static __global__ void mm_ids_helper_mw(
++        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
++        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
++    constexpr int warp_size = WARP_SIZE;
++    constexpr int n_expert_used = n_expert_used_template;
++    constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value;
++    static_assert(n_expert_used_template > 0 && neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
++    constexpr int tok_per_iter = warp_size/neu_padded;
++    const int expert = blockIdx.x;
++    const int warp = threadIdx.x / warp_size, lane = threadIdx.x % warp_size;
++
++    extern __shared__ char data_mm_ids_helper[];
++    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
++    __shared__ int warp_cnt[nwarps], warp_prev[nwarps];
++
++    const int chunk   = ((n_tokens + nwarps - 1)/nwarps + tok_per_iter - 1)/tok_per_iter*tok_per_iter;
++    const int t_begin = min(n_tokens, warp*chunk);
++    const int t_end   = min(n_tokens, t_begin + chunk);
++
++    int nex_prev   = 0;
++    int it_compact = 0;
++    for (int it0 = t_begin; it0 < t_end; it0 += tok_per_iter) {
++        const int it  = it0 + lane / neu_padded;
++        const int iex = lane % neu_padded;
++        const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < t_end ?
++            ids[it*si1 + iex] : INT_MAX;
++        const int iex_used = expert_used == expert ? iex : -1;
++        nex_prev += expert_used < expert;
++
++        const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
++        int it_compact_add_lower = 0;
++#pragma unroll
++        for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
++            const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
++            if (lane >= offset) {
++                it_compact_add_lower += tmp;
++            }
++        }
++        if (iex_used != -1) {
++            store[t_begin + it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
++        }
++        it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
++    }
++    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
++    if (lane == 0) {
++        warp_cnt[warp]  = it_compact;
++        warp_prev[warp] = nex_prev;
++    }
++    __syncthreads();
++    int offset = 0, nex_prev_all = 0, n_all = 0;
++#pragma unroll
++    for (int w = 0; w < nwarps; ++w) {
++        offset       += w < warp ? warp_cnt[w] : 0;
++        nex_prev_all += warp_prev[w];
++        n_all        += warp_cnt[w];
++    }
++
++    for (int itc = lane; itc < it_compact; itc += warp_size) {
++        const mm_ids_helper_store store_it = store[t_begin + itc];
++        const int it       = store_it.it();
++        const int iex_used = store_it.iex_used();
++        const int pos      = nex_prev_all + offset + itc;
++        ids_dst[pos] = it*n_expert_used + iex_used;
++        if (write_inverse) {
++            ids_src1[it*n_expert_used + iex_used] = pos;
++        } else {
++            ids_src1[pos] = it*sis1 + iex_used % nchannels_y;
++        }
++    }
++
++    if (threadIdx.x != 0) {
++        return;
++    }
++    expert_bounds[expert] = nex_prev_all;
++    if (expert == static_cast<int>(gridDim.x) - 1) {
++        expert_bounds[gridDim.x] = nex_prev_all + n_all;
++    }
++    GGML_UNUSED(n_expert_used_var);
++}
++
+ template <int n_expert_used_template>
+ static void launch_mm_ids_helper(
+         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+@@ -139,6 +225,20 @@ static void launch_mm_ids_helper(
+     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+     CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
+ 
++    if constexpr (n_expert_used_template > 0) {
++        static const bool mw_off = getenv("GGML_CUDA_MMID_SINGLE_WARP") && atoi(getenv("GGML_CUDA_MMID_SINGLE_WARP")) != 0;
++        constexpr int nwarps = 16;
++        if (!mw_off && warp_size == WARP_SIZE && n_tokens >= 256) {
++            const size_t smpbo_dyn = smpbo - 2*nwarps*sizeof(int);   // the per-warp counts are static shared memory
++            CUDA_SET_SHARED_MEMORY_LIMIT((mm_ids_helper_mw<n_expert_used_template, nwarps>), smpbo_dyn);
++            const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
++            GGML_ASSERT(nbytes_shared <= smpbo_dyn);
++            mm_ids_helper_mw<n_expert_used_template, nwarps><<<n_experts, nwarps*WARP_SIZE, nbytes_shared, stream>>>
++                (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
++            return;
++        }
++    }
++
+     const dim3 num_blocks(n_experts, 1, 1);
+     const dim3 block_size(warp_size, 1, 1);
+     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+-- 
+2.43.0
+

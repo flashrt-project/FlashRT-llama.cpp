@@ -1,0 +1,112 @@
+From 269d226565f17e1678cbd0d72f7487a7557d1118 Mon Sep 17 00:00:00 2001
+From: LiangSu8899 <7thuniversels@gmail.com>
+Date: Wed, 21 Oct 2026 20:44:08 -0400
+Subject: [PATCH 7/8] kv-cache: fill the reused rows of the KQ mask in parallel
+
+Rows after the first one of a sequence copy that row and re-check only the
+cells near the batch positions, so they depend on nothing but the first row
+and the sequence's index list. They are now filled after the sequential
+pass, on up to 8 threads when the mask is large (>= 4M elements). The CPU
+mask fill dominated the host gap between large prefill ubatches (~45 ms per
+4096-token ubatch at 8K context). Identical mask contents
+(LLAMA_KQ_MASK_SERIAL=1 keeps the serial fill).
+
+---
+ src/llama-kv-cache.cpp | 62 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 6f0e3f7..9b32fac 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -12,6 +12,7 @@
+ #include <limits>
+ #include <map>
+ #include <stdexcept>
++#include <thread>
+ #include <unordered_map>
+ 
+ static bool ggml_is_power_of_2(int n) {
+@@ -1604,11 +1605,20 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
+         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
+ 
++        // rows that reuse the mask of their sequence's first row only read that row and the
++        // sequence's idxs: they are filled after this pass, in parallel for large masks
++        std::vector<uint32_t> deferred;
++
+         for (uint32_t ii = 0; ii < n_tps; ++ii) {
+             const uint32_t i = s*n_tps + ii;
+ 
+             const llama_seq_id seq_id = ubatch->seq_id[i][0];
+ 
++            if (!alibi && seq_srct.find(seq_id) != seq_srct.end()) {
++                deferred.push_back(i);
++                continue;
++            }
++
+             const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+ 
+                   llama_pos p0 = -1;
+@@ -1719,6 +1729,58 @@ skip:
+                 data[idst + j] = mask_drop;
+             }
+         }
++
++        // deferred rows: copy of the sequence's first row, then the same checks on its idxs
++        auto fill_deferred = [&](const uint32_t i) {
++            const llama_seq_id seq_id = ubatch->seq_id[i][0];
++            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
++            const llama_pos p1   = ubatch->pos[i];
++            const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
++            const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
++            const uint64_t idst      = n_kv*i;
++            const uint64_t idst_prev = n_kv*seq_srct.at(seq_id);
++            std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
++            const auto & idxs = seq_idxs.at(seq_id);
++            for (const uint32_t j : idxs) {
++                bool keep = !cells.is_empty(j) && cells.seq_has(j, seq_id);
++                if (keep) {
++                    const llama_pos p0 = cells.pos_get(j);
++                    if (causal) {
++                        if (p0 > p1) {
++                            keep = false;
++                        } else if (is_2d && p0 == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
++                            keep = false;
++                        }
++                    }
++                    if (keep && swa) {
++                        const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
++                        if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
++                            keep = false;
++                        }
++                    }
++                }
++                data[idst + j] = keep ? mask_keep : mask_drop;
++            }
++        };
++        const size_t n_def = deferred.size();
++        const unsigned n_thr = std::min<unsigned>(8, std::max(1u, std::thread::hardware_concurrency()));
++        if (n_def*n_kv >= (1u << 22) && n_thr > 1 && !getenv("LLAMA_KQ_MASK_SERIAL")) {
++            std::vector<std::thread> workers;
++            for (unsigned t = 0; t < n_thr; ++t) {
++                workers.emplace_back([&, t]() {
++                    for (size_t r = t; r < n_def; r += n_thr) {
++                        fill_deferred(deferred[r]);
++                    }
++                });
++            }
++            for (auto & w : workers) {
++                w.join();
++            }
++        } else {
++            for (const uint32_t i : deferred) {
++                fill_deferred(i);
++            }
++        }
+     }
+ }
+ 
+-- 
+2.43.0
+

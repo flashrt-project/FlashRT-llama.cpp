@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+title: "FlashRT-llama.cpp"
+message: >-
+  Please cite the FlashRT paper below and acknowledge llama.cpp as the
+  inference host when using this integration.
+type: software
+authors:
+  - family-names: "Su"
+    given-names: "Liang"
+repository-code: "https://github.com/flashrt-project/FlashRT-llama.cpp"
+url: "https://github.com/flashrt-project/FlashRT-llama.cpp"
+license: "Apache-2.0"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Su"
+      given-names: "Liang"
+    - family-names: "Chen"
+      given-names: "David"
+    - family-names: "Li"
+      given-names: "Jason"
+    - family-names: "Guo"
+      given-names: "Kevin"
+    - family-names: "Lv"
+      given-names: "Teresa"
+  title: "FlashRT-PAI: Fast Kernels Are Not Fast Pipelines for Physical AI Inference"
+  year: 2026
+  doi: "10.48550/arXiv.2610.24349"
+  url: "https://arxiv.org/abs/2610.24349"
+references:
+  - type: software
+    title: "llama.cpp"
+    authors:
+      - name: "llama.cpp contributors"
+    repository-code: "https://github.com/ggml-org/llama.cpp"
+    url: "https://github.com/ggml-org/llama.cpp"
+    license: "MIT"
