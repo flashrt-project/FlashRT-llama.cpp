@@ -1269,6 +1269,7 @@ static bool frt_moetailpf_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     if (m1->op != GGML_OP_MUL || m1->src[1] != gr || m2->op != GGML_OP_MUL || m2->src[0] != m1 || m3->op != GGML_OP_MUL || m3->src[0] != m2) return false;
     const ggml_tensor * x = m1->src[0], * ids = gr->src[1], * ev = m2->src[1], * wv = m3->src[1];
     if (x->op != GGML_OP_MUL_MAT_ID || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) return false;
+    if (ggml_nelements(sc) != x->src[0]->ne[2]) return false;   // one scale per expert
     const int64_t n_embd = x->ne[0], n_used = x->ne[1], T = x->ne[2];
     if (T <= 1 || T > FRT_PF_TOKENS_MAX || n_used != 6 || n_embd != FRT_K_EMBD || n_embd % 256 != 0) return false;
     if (ids->type != GGML_TYPE_I32 || ids->ne[0] != n_used || ids->ne[1] != T || ids->nb[0] != sizeof(int32_t) || x->src[2] != ids) return false;
@@ -1517,7 +1518,9 @@ static frt_moe_tail g_moe_tail = {};
 static float * g_route_logits = nullptr;
 static unsigned int * g_route_count = nullptr;
 static block_q8_1 * g_act_q8 = nullptr;          // q8_1 of the ffn-normed activation (64 blocks)
-static const void * g_act_q8_src = nullptr;      // tensor data the last matched ROUTE published for
+static const ggml_tensor * g_act_q8_src = nullptr;   // ffn-normed activation tensor the last matched ROUTE
+                                                      // published q8_1 for (graph tensor, not its data: buffers
+                                                      // are reused across layers)
 
 // topk_moe_cuda<256, false> for one row, one warp: sigmoid, iterative top-k
 // (lower index wins ties), clamped-sum weight normalization. Outputs go to
@@ -1605,7 +1608,6 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE, 1) frt_route(
         block_q8_1 * xq_out, int32_t * ids_snap, float * w_snap) {
     constexpr int RPC = NW * WARP_SIZE / 256;   // router rows per CTA, one 256-thread group each
     static_assert(RPC * 256 == NW * WARP_SIZE, "mul_mat_vec_f block size");
-    constexpr int n_experts = 256;
     ggml_cuda_pdl_lc();
     __shared__ float xn[FRT_K_EMBD];
     __shared__ float red[32];
@@ -1737,7 +1739,7 @@ static bool frt_route_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph,
     frt_route_m m;
     if (!on || !frt_route_match(cgraph, i, m)) return false;
     frt_route_launch(ctx, m);
-    g_act_q8_src = m.fn->data;
+    g_act_q8_src = m.fn;
     *skip_count = 12;
     return true;
 }
@@ -2151,7 +2153,8 @@ static bool frt_moeffn_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     static const bool on = frt_window_on("GGML_FLASHRT_NO_MOEFFN");
     frt_moeffn_m m;
     if (!on || !frt_moeffn_match(cgraph, i, m)) return false;
-    const bool act_q8 = g_act_q8_src == m.act->data;   // ROUTE already published q8_1(act) for this layer
+    const ggml_tensor * act_src = m.act->view_src ? m.act->view_src : m.act;
+    const bool act_q8 = act_src == g_act_q8_src && m.act->data == act_src->data;   // ROUTE published q8_1(act) for this layer
     g_act_q8_src = nullptr;
     frt_moeffn_launch(ctx, m, act_q8);
     *skip_count = m.end - i + 1;
@@ -2752,10 +2755,13 @@ static void frt_pf_check_compare(ggml_backend_cuda_context & ctx, ggml_cgraph * 
     g_pf_chk.lo = nullptr;
 }
 
+// The scratch buffers and cross-window state are allocated for one device:
+// the first SM120 device whose graph reaches the prepare hook. Graphs on any
+// other device (e.g. a layer split) run stock.
+static int g_frt_device = -1;
+
 bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
-    if (!frt_layer_enabled()) return false;
-    static const bool cc_ok = ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL;
-    if (!cc_ok) return false;
+    if (!frt_layer_enabled() || ctx.device != g_frt_device) return false;
     if (frt_attnqkv_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_route_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_denseffn_try(ctx, cgraph, i, skip_count)) return true;
@@ -2773,7 +2779,10 @@ bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
 void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
     frt_dump_graph(cgraph);
     if (!frt_layer_enabled()) return;
-    if (g_moe_glu == nullptr) {   // eager: this hook always runs before any capture begins
+    g_act_q8_src = nullptr;
+    if (g_frt_device < 0) {   // eager: this hook always runs before any capture begins
+        if (ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_BLACKWELL) return;
+        g_frt_device = ctx.device;
         ggml_cuda_set_device(ctx.device);
         CUDA_CHECK(cudaMalloc(&g_moe_glu, FRT_MOE_GLU_CAP * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_qkv, FRT_QKV_ROWS_MAX * sizeof(float)));
