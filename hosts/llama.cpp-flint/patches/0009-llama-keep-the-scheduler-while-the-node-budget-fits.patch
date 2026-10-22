@@ -1,0 +1,45 @@
+From ea5db9e4265252ec01a462d16f2a10bca980e4ef Mon Sep 17 00:00:00 2001
+From: LiangSu8899 <7thuniversels@gmail.com>
+Date: Thu, 22 Oct 2026 09:02:00 -0400
+Subject: [PATCH] llama: keep the scheduler while the node budget fits
+
+The node budget of the reserve graph moves with the number of per-sequence
+backend samplers: a server adds and removes one chain per request, so the
+budget rarely repeats and the exact-match test of the previous change
+still recreated the scheduler (and every compute buffer, including the
+pinned host buffer, plus all cached CUDA graphs) on almost every request:
+~130 ms of GPU idle time each on an RTX 5090 with 64 slots. The scheduler
+is now recreated only when the budget grows, and it is created with 25%
+headroom (LLAMA_SCHED_NODE_HEADROOM) so it rarely has to grow.
+---
+ src/llama-context.cpp | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c0dabcd..07563c0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -748,9 +748,18 @@ void llama_context::sched_reserve() {
+         const char * env = getenv("LLAMA_SCHED_RESERVE_NEW");
+         return env && atoi(env) != 0;
+     }();
++    // The node budget moves with the number of per-sequence backend samplers (a server
++    // adds and removes one chain per request), so an exact-match test recreates the
++    // scheduler and every compute buffer on almost every request. Keep the scheduler
++    // while the budget fits, and grow it with headroom (LLAMA_SCHED_NODE_HEADROOM, default 25%).
++    static const double headroom = [] {
++        const char * env = getenv("LLAMA_SCHED_NODE_HEADROOM");
++        return env ? atof(env) : 0.25;
++    }();
+     if (always_new || !sched || model.hparams.no_alloc ||
+-        sched_max_nodes != max_nodes || sched_parallel != cparams.pipeline_parallel) {
+-        sched_new(max_nodes, cparams.pipeline_parallel);
++        sched_max_nodes < max_nodes || sched_parallel != cparams.pipeline_parallel) {
++        const size_t budget = always_new ? max_nodes : (size_t) (max_nodes * (1.0 + headroom));
++        sched_new(budget, cparams.pipeline_parallel);
+     }
+ 
+     llama_memory_context_ptr mctx;
+-- 
+2.43.0
+

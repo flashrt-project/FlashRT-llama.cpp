@@ -317,7 +317,7 @@ static bool frt_b_dp4a() {
 template <int KB, int EPI> struct frt_m_ntt { static constexpr int v = KB <= 32 ? 2 : 1; };   // double-buffered tiles: 16 tokens (K = 2048), 8 (K = 4096 / 6144)
 template <int KB, int EPI> struct frt_m_nw { static constexpr int v = KB <= 32 ? 8 : 16; };
 // m-tiles per CTA: 2 for K = 2048 (weights 2 x 4 warps x 8 blocks in registers), 1 otherwise; dense GLU stays at 1
-template <int KB, int EPI> struct frt_m_mt { static constexpr int v = (KB <= 32 && EPI != FRT_B_EPI_GLU) ? 2 : 1; };
+template <int KB, int EPI> struct frt_m_mt { static constexpr int v = 1; };   // one m-tile per CTA: 98 registers, two CTAs per SM
 
 // token-tile size per K: keep the static shared buffer under 48 KB
 template <int KB> struct frt_b_tt { static constexpr int v = KB <= 16 ? 32 : KB <= 32 ? 16 : KB <= 64 ? 8 : 4; };

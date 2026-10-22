@@ -199,7 +199,10 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE) frt_m_gemv(const frt_b_
     constexpr int ROWS = MT * FRT_M_ROWS;
     static_assert(NW % MT == 0, "warps per m-tile");
     constexpr size_t RED = (size_t) NW * (GLU ? 2 : 1) * TT * FRT_M_ROWS * sizeof(float);
-    constexpr int NB = ((size_t) 2 * TT * TS + RED <= 99 * 1024) ? 2 : 1;   // token-tile buffers (double-buffered when they fit)
+    // token-tile buffers: single-buffered when that lets two CTAs share an SM (ncu: the dense kernels are
+    // latency bound at 1 CTA / SM, 'no eligible warp' 70%), double-buffered otherwise when it fits
+    constexpr bool TWO_CTAS = (size_t) TT * TS + RED <= 48 * 1024 && NW * WARP_SIZE <= 256;
+    constexpr int NB = TWO_CTAS ? 1 : (((size_t) 2 * TT * TS + RED <= 99 * 1024) ? 2 : 1);
     extern __shared__ __align__(16) uint8_t frt_m_smem[];
     uint8_t * tok_buf = frt_m_smem;                               // [NB][TT * TS]
     float * red = (float *) (frt_m_smem + (size_t) NB * TT * TS);
@@ -312,7 +315,8 @@ static void frt_m_gemv_launch(const frt_b_gemv_args & a, cudaStream_t stream) {
     constexpr int TT = NTT * 8;
     constexpr size_t red = (size_t) NW * (GLU ? 2 : 1) * TT * FRT_M_ROWS * sizeof(float);
     constexpr size_t smem1 = (size_t) TT * frt_m_tok<KB>::stride;
-    constexpr size_t smem = (2 * smem1 + red <= 99 * 1024) ? 2 * smem1 + red : smem1 + red;
+    constexpr bool two_ctas = smem1 + red <= 48 * 1024 && NW * WARP_SIZE <= 256;
+    constexpr size_t smem = two_ctas ? smem1 + red : ((2 * smem1 + red <= 99 * 1024) ? 2 * smem1 + red : smem1 + red);
     static_assert(smem <= 99 * 1024, "sm_120: 99 KB of shared memory per block");
     static bool attr = false;
     if (!attr) {
