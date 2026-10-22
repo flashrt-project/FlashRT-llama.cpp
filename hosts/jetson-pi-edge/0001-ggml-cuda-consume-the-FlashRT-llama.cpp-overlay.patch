@@ -1,6 +1,8 @@
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 05e71d1..a85de14 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
 +++ b/ggml/src/ggml-cuda/CMakeLists.txt
-@@ -135,22 +135,24 @@
+@@ -135,22 +135,24 @@ if (CUDAToolkit_FOUND)
          # FlashRT NVFP4 tcgen05 kernels for Jetson AGX Thor (SM110). Compiled
          # as a separate object library because they require -arch=sm_110a and
          # CUTLASS headers, unlike the rest of ggml-cuda.
@@ -35,12 +37,41 @@
          else()
              get_filename_component(FLASHRT_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../cutlass" ABSOLUTE)
          endif()
-@@ -158,7 +160,7 @@
+@@ -158,7 +160,7 @@ if (CUDAToolkit_FOUND)
              message(FATAL_ERROR "GGML_CUDA_FLASHRT: CUTLASS not found at ${FLASHRT_CUTLASS_DIR} (set GGML_CUDA_FLASHRT_CUTLASS_DIR)")
          endif()
  
 -        set(FLASHRT_ADAPTER_DIR "${FLASHRT_PUBLIC_DIR}/flash_rt/structures/adapters/ggml")
-+        set(FLASHRT_ADAPTER_DIR "${FLASHRT_DIR}")
++        set(FLASHRT_ADAPTER_DIR "${FLASHRT_DIR}/src")
          if (NOT EXISTS "${FLASHRT_ADAPTER_DIR}/fr_dispatch.cu")
              message(FATAL_ERROR "GGML_CUDA_FLASHRT: ggml adapter not found at ${FLASHRT_ADAPTER_DIR}")
          endif()
+@@ -176,8 +178,8 @@ if (CUDAToolkit_FOUND)
+             ${FLASHRT_ADAPTER_DIR}/fr_dispatch.cu)
+ 
+         # optional AOT FlashAttention-4 module for the SigLIP vision attention
+-        set(FLASHRT_FA4_OBJ  "${FLASHRT_ADAPTER_DIR}/fa4_aot/fa4_siglip_fwd.o")
+-        set(FLASHRT_FA4P_OBJ "${FLASHRT_ADAPTER_DIR}/fa4_aot/fa4_prefill_fwd.o")
++        set(FLASHRT_FA4_OBJ  "${FLASHRT_DIR}/fa4_aot/fa4_siglip_fwd.o")
++        set(FLASHRT_FA4P_OBJ "${FLASHRT_DIR}/fa4_aot/fa4_prefill_fwd.o")
+         if (EXISTS "${FLASHRT_FA4_OBJ}" AND EXISTS "${FLASHRT_FA4P_OBJ}")
+             target_sources(ggml-cuda-flashrt PRIVATE
+                 ${FLASHRT_ADAPTER_DIR}/fr_fa4_vit.cu
+@@ -192,6 +194,8 @@ if (CUDAToolkit_FOUND)
+             CUDA_ARCHITECTURES "110a")
+         target_include_directories(ggml-cuda-flashrt PRIVATE
+             ${FLASHRT_ADAPTER_DIR}
++            ${FLASHRT_DIR}/include
++            ${FLASHRT_DIR}
+             ${FLASHRT_PUBLIC_DIR}/csrc
+             ${FLASHRT_CUTLASS_DIR}/include
+             ${FLASHRT_CUTLASS_DIR}/tools/util/include
+@@ -202,6 +206,8 @@ if (CUDAToolkit_FOUND)
+         # that header includes common.cuh back from this directory.
+         target_include_directories(ggml-cuda PRIVATE
+             ${FLASHRT_ADAPTER_DIR}
++            ${FLASHRT_DIR}/include
++            ${FLASHRT_DIR}
+             ${CMAKE_CURRENT_SOURCE_DIR})
+         target_link_libraries(ggml-cuda-flashrt PRIVATE CUDA::cudart CUDA::cublas)
+         target_compile_options(ggml-cuda-flashrt PRIVATE

@@ -1,7 +1,7 @@
-From ab3d3dc5de3fcd4427f379009eb6092e835e627f Mon Sep 17 00:00:00 2001
+From 1b1043235f9c8c9bd046b15946d4f6e07b305cf4 Mon Sep 17 00:00:00 2001
 From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Fri, 11 Sep 2026 16:20:41 -0400
-Subject: [PATCH 3/3] cuda: consume the FlashRT-llama.cpp overlay at
+Subject: [PATCH] cuda: consume the FlashRT-llama.cpp overlay at
  ggml/src/ggml-cuda/flashrt
 
 The SM120 window translation unit and the two FlashRT kernels it needs
@@ -10,11 +10,11 @@ to override), which vendors the kernel sources and carries CUTLASS. The
 sm_120a pass is scoped to those three sources instead of a global
 CMAKE_CUDA_FLAGS gencode.
 ---
- ggml/src/ggml-cuda/CMakeLists.txt | 44 +++++++++++++++++++++++++------
- 1 file changed, 36 insertions(+), 8 deletions(-)
+ ggml/src/ggml-cuda/CMakeLists.txt | 46 +++++++++++++++++++++++++------
+ 1 file changed, 38 insertions(+), 8 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
-index 70f67e9..8a69c84 100644
+index 70f67e9..fdc8f07 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
 +++ b/ggml/src/ggml-cuda/CMakeLists.txt
 @@ -128,14 +128,36 @@ if (CUDAToolkit_FOUND)
@@ -49,7 +49,7 @@ index 70f67e9..8a69c84 100644
 +            message(FATAL_ERROR "GGML_CUDA_FLASHRT_SM120: CUTLASS not found at ${FLASHRT_CUTLASS_DIR} (git submodule update --init --recursive in the overlay, or set GGML_CUDA_FLASHRT_CUTLASS_DIR)")
 +        endif()
 +        set(FLASHRT_SM120_SOURCES
-+            ${FLASHRT_DIR}/fr_win_qwen36_sm120.cu
++            ${FLASHRT_DIR}/src/fr_win_qwen36_sm120.cu
 +            ${FLASHRT_DIR}/vendor/csrc/quantize/f32_act_to_nvfp4_swizzled_mrows_sm120.cu
 +            ${FLASHRT_DIR}/vendor/csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_f32out_sm120.cu)
 +        # The kernel bodies are guarded by __CUDA_ARCH_FEAT_SM120_ALL: they
@@ -61,7 +61,7 @@ index 70f67e9..8a69c84 100644
      endif()
  
      ggml_add_backend_library(ggml-cuda
-@@ -145,7 +167,13 @@ if (CUDAToolkit_FOUND)
+@@ -145,7 +167,15 @@ if (CUDAToolkit_FOUND)
  
      if (GGML_CUDA_FLASHRT_SM120)
          add_compile_definitions(GGML_CUDA_FLASHRT_SM120)
@@ -69,6 +69,8 @@ index 70f67e9..8a69c84 100644
 +        target_include_directories(ggml-cuda PRIVATE
 +            ${CMAKE_CURRENT_SOURCE_DIR}
 +            ${FLASHRT_DIR}
++            ${FLASHRT_DIR}/src
++            ${FLASHRT_DIR}/include
 +            ${FLASHRT_DIR}/vendor/csrc
 +            ${FLASHRT_CUTLASS_DIR}/include
 +            ${FLASHRT_CUTLASS_DIR}/tools/util/include)

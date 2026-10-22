@@ -1,41 +1,48 @@
 # Usage
 
-## Building a host against the adapter
+Run commands from the overlay repository root unless a host guide says
+otherwise. Choose the integration for your model and GPU:
 
-This repository is mounted by a host at `ggml/src/ggml-cuda/flashrt`
-(as a git submodule) and consumed at build time: the host's CMake
-compiles the translation units here, the vendored FlashRT kernels under
-`vendor/csrc/`, and takes CUTLASS from `third_party/cutlass`. Two hosts
-are wired today, each with its pin, patches and instructions under
-`hosts/`:
+| Target | Build / integration guide |
+|---|---|
+| Flint NVFP4, RTX 5090 / SM120 | [Flint host](../hosts/llama.cpp-flint/README.md) |
+| Qwen3.6-35B-A3B, RTX 5090 / SM120 | [Qwen host](../hosts/llama.cpp/README.md) |
+| π0 / π0.5, Jetson AGX Thor / SM110 | [Jetson-PI-Edge host](../hosts/jetson-pi-edge/README.md) |
 
-- `hosts/llama.cpp/` — upstream llama.cpp on RTX 5090 (SM120), the
-  Qwen3.6-35B-A3B decode window set. `hosts/llama.cpp/build.sh` builds
-  it from scratch.
-- `hosts/jetson-pi-edge/` — Jetson-PI-Edge on Jetson AGX Thor (SM110),
-  pi0 / pi0.5.
+## Build
 
 ```bash
 git clone --recursive https://github.com/flashrt-project/FlashRT-llama.cpp
-FlashRT-llama.cpp/hosts/llama.cpp/build.sh /path/to/work
+cd FlashRT-llama.cpp
+
+# Choose one host; each command creates a separate pinned llama.cpp checkout.
+bash hosts/llama.cpp-flint/build.sh ../llama.cpp-flint
+bash hosts/llama.cpp/build.sh ../llama.cpp-qwen
 ```
 
-Options:
+The scripts apply the target's patches and mount the overlay at
+`ggml/src/ggml-cuda/flashrt`. Jetson-PI-Edge has a separate migration
+procedure in its guide. Model files are supplied separately.
 
-- `GGML_CUDA_FLASHRT` (OFF by default) — enables the layer. Without it the
-  build is stock llama.cpp; every integration point is compiled out.
-- `GGML_CUDA_FLASHRT_DIR` — path to an overlay checkout, overriding the
-  submodule location.
-- `GGML_CUDA_FLASHRT_CUTLASS_DIR` — CUTLASS override; defaults to
-  `third_party/cutlass` inside this repository.
+| Build option | Purpose |
+|---|---|
+| `GGML_CUDA_FLASHRT_SM120` | Enable the Flint or Qwen integration in its corresponding host |
+| `GGML_CUDA_FLASHRT` | Enable the Thor integration |
+| `GGML_CUDA_FLASHRT_DIR` | Use an overlay checkout outside the default mount location |
+| `GGML_CUDA_FLASHRT_CUTLASS_DIR` | Override the CUTLASS checkout where the target uses it |
 
-The adapter is built as a separate CMake OBJECT library with
-`-arch=sm_110a` and CUTLASS headers; the rest of ggml-cuda compiles
-unchanged. The AOT FlashAttention-4 windows enable automatically when the
-`fa4_aot/*.o` artifacts are present (they are checked in; see
-`fa4_aot/README.md` to regenerate).
+All integrations are opt-in at build time. The host compiles the native
+sources from `src/`, interfaces from `include/`, and the selected upstream
+kernels from `vendor/csrc/`. CUTLASS is pinned under `third_party/cutlass`.
+Thor builds its kernels as a separate SM110a object library; its optional
+FA4 modules are the checked-in artifacts under `fa4_aot/` (see
+[regeneration](../fa4_aot/README.md)).
 
 ## Model preparation
+
+Flint uses the official NVFP4 GGUF directly. Qwen's stock-GGUF and optional
+NVFP4-head workflows are described in its section below. For Thor or custom
+quantization workflows:
 
 - LLM weights: quantize with the host's `llama-quantize` to the `NVFP4`
   target (exposed by the FlashRT branch). Setting `GGML_NVFP4_MSE=1`
@@ -43,7 +50,7 @@ unchanged. The AOT FlashAttention-4 windows enable automatically when the
   search instead of plain absmax (slower to quantize, more accurate).
 - The mmproj (vision tower) is quantized to NVFP4 the same way.
 
-## Running
+## Running Jetson-PI-Edge policies
 
 ```bash
 PI_MODEL=pi05 ./build/bin/llama-server -m <llm.gguf> --mmproj <mmproj.gguf> \
@@ -54,7 +61,7 @@ The server exposes the host's action-chunk HTTP protocol (reset → images →
 state → infer). Warm-up matters on Thor: latency reaches its steady state
 after roughly 15 inferences.
 
-## Runtime switches
+## Thor runtime switches
 
 All switches are environment variables; unset means enabled/default.
 
@@ -68,7 +75,7 @@ All switches are environment variables; unset means enabled/default.
 | `GGML_FLASHRT_NO_PREFILL_FA4=1` | disable the AOT FA4 prefill attention |
 | `GGML_FLASHRT_NO_KV_TAIL=1` | disable the batched persistent-KV tail copies |
 | `GGML_FLASHRT_NO_VIS_F16=1` | disable the vision QKV window's direct f16 K/V outputs |
-| `GGML_CUDA_FLASHRT_NO_CACHE=1` | disable the pointer-keyed weight repack cache (required for `test-backend-ops`, see TESTING.md) |
+| `GGML_CUDA_FLASHRT_NO_CACHE=1` | disable the pointer-keyed weight repack cache (required for `test-backend-ops`, see testing.md) |
 | `GGML_FLASHRT_DEBUG=1` | print window-match failure diagnostics |
 | `GGML_FLASHRT_DUMP=<file>` / `GGML_FLASHRT_DUMP_MAX=<n>` | dump the first n evaluated graphs' node sequences |
 
@@ -145,7 +152,7 @@ top-6/256 MoE with an ungated shared expert) on the official NVFP4 GGUF.
 The host is llama.cpp with the Flint model (upstream PR #30928, pinned in
 `hosts/llama.cpp-flint/PIN`); `hosts/llama.cpp-flint/build.sh` clones it,
 applies the patch series and builds with `-DGGML_CUDA_FLASHRT_SM120=ON`.
-The window file is `fr_win_flint_sm120.cu`; it is compiled inside the
+The window file is `src/fr_win_flint_sm120.cu`; it is compiled inside the
 ggml-cuda target with ggml's own flags.
 
 Recommended serving flags (official Flint flags plus the ubatch):
@@ -161,7 +168,7 @@ is slower.
 
 Numerics. The M = 1 windows and stock fallbacks are bit-identical to stock
 llama.cpp at the same `-ub`. Set `GGML_FLASHRT_NO_BATCHED=1` to reproduce the
-original bit-exact decode/prefill protocol in TESTING.md. The default
+original bit-exact decode/prefill protocol in testing.md. The default
 batched windows change fp32 summation order and use the host-reference gate
 below. The M = 1 opt-in decode attention `FRT_ATTNDEC=1`
 (tensor-core GQA attention with f32-level operands), gated by
@@ -191,7 +198,7 @@ scales are applied in fp32), the routed experts are grouped by the top-k
 selection, and the decode attention runs over the sequences (per-sequence KV
 slots, i.e. without `-kvu`). Each token is computed with the same per-element
 arithmetic as the M = 1 windows; only the fp32 summation order differs, so
-batched outputs are gated by the host reference in TESTING.md, not by bits.
+batched outputs are gated by the host reference in testing.md, not by bits.
 Defaults were measured on an RTX 5090 with 1000-token prompts.
 
 | variable | effect |
@@ -200,7 +207,7 @@ Defaults were measured on an RTX 5090 with 1000-token prompts.
 | `FRT_B_MOE_MIN_T=<t>` (9), `FRT_B_MOE_MAX_T=<t>` (128) | token range of the batched routing / MoE windows; below it stock's per-slot MMVQ is faster, above it stock MMQ (prompt-sized ubatches) |
 | `FRT_B_ATTN=0`, `FRT_B_ATTN_MAX_SEQ=<n>` (32) | batched decode attention off / its sequence cap (stock's f16 tensor-core kernel is faster at 64 x 1K rows); `FRT_B_ATTN_CTAS`, `FRT_B_ATTN_NS` tune chunking |
 | `FRT_B_DP4A=1`, `FRT_S_OFF=1`, `FRT_S_DN=1`, `FRT_P_ON=1`, `FRT_T_ON=1` | kernel variants: CUDA-core dp4a; gate/up back to the register-resident kernel; down with the shared-memory kernel; persistent ring; TMA bulk ring (all slower than the defaults, kept for study) |
-| `FRT_B_HREF=1` | test aid (with `GGML_CUDA_DISABLE_GRAPHS=1`): every batched window is checked against a double-precision host reference, see TESTING.md |
+| `FRT_B_HREF=1` | test aid (with `GGML_CUDA_DISABLE_GRAPHS=1`): every batched window is checked against a double-precision host reference, see testing.md |
 | `FRT_B_CHECK=1` | test aid: batched windows compute into private buffers and are compared against ggml's own execution |
 | `FRT_B_DBG=<bits>` | timing aid: 1 skips the MMAs, 2 the token staging, 4 the weight loads (outputs are wrong) |
 

@@ -7,7 +7,7 @@ patch series in `patches/`:
 1. Jinja hexadecimal escapes (backport of upstream PR #30929, needed by
    the Flint chat template).
 2. `GGML_CUDA_FLASHRT_SM120`: the CMake block that compiles
-   `fr_win_flint_sm120.cu` from the overlay (submodule at
+   `src/fr_win_flint_sm120.cu` from the overlay (submodule at
    `ggml/src/ggml-cuda/flashrt` or `GGML_CUDA_FLASHRT_DIR`), the fuse-hook
    call at the top of `ggml_cuda_try_fuse` and an eager pre-capture hook in
    graph compute. Compiled out unless the option is on;
@@ -36,7 +36,7 @@ Patches 3–9 change no values: every patch keeps logits bit-identical.
 `build.sh <work dir> [llama.cpp url or local clone]` reproduces the build
 from scratch: clone, fetch the PR head, check out the pin, `git am` the
 series, mount the overlay, configure with `-DGGML_CUDA_FLASHRT_SM120=ON`.
-Recommended serving flags and the runtime switches are in `../../USAGE.md`.
+Recommended serving flags and the runtime switches are in `../../docs/usage.md`.
 
 ## Numerics
 
@@ -49,9 +49,9 @@ with a 4096-ubatch context; 8192 prefill tokens at `-ub` 512, 2048, 4096,
 8192 and 3000 (a partial last ubatch); 512 prefill tokens at ubatches of
 2, 4, 8 and 32. Real-prompt greedy outputs are token-identical to stock. The opt-in decode attention
 (`FRT_ATTNDEC=1`) is non-bitwise; its quality is gated against stock's own
-path variation (see `../../TESTING.md`). The default batched windows also change fp32
+path variation (see `../../docs/testing.md`). The default batched windows also change fp32
 summation order and use the sampled double-precision host-reference gate
-in `../../TESTING.md`.
+in `../../docs/testing.md`.
 
 ## Decode throughput
 
@@ -116,7 +116,7 @@ decode kernels.
 
 The default windows handle 2–128 tokens with int8 tensor-core dot products,
 expert grouping and multi-sequence decode attention (up to 32 sequences by
-default). See `../../USAGE.md` for caps, switches and the
+default). See `../../docs/usage.md` for caps, switches and the
 one-active-context-per-GPU requirement. Batched output is not claimed
 bit-exact; numerical tolerances, sampling coverage and correctness commands
-are specified in `../../TESTING.md`.
+are specified in `../../docs/testing.md`.

@@ -1,23 +1,27 @@
 # Development guide
 
+Commands use paths relative to the repository root. Native implementation
+files live in `src/`, the launch interface in `include/`, and host build
+integration in `hosts/`. The host builds these sources directly.
+
 ## Architecture
 
 The adapter has two halves with a hard boundary:
 
-- **Framework-free half** (`fr_repack.cu`, `fr_quant_act.cu`,
-  `fr_qkv_post.cu`, `fr_ada.cu`, `fr_decode_attn.cu`, `fr_fa4_vit.cu`):
-  plain CUDA translation units, entry points declared in `fr_kernels.h`
+- **Framework-free half** (`src/fr_repack.cu`, `src/fr_quant_act.cu`,
+  `src/fr_qkv_post.cu`, `src/fr_ada.cu`, `src/fr_decode_attn.cu`, `src/fr_fa4_vit.cu`):
+  plain CUDA translation units, launch interface declared in `include/fr_kernels.h`
   (raw pointers + `cudaStream_t`, no ggml or CUTLASS types in the
   header). GEMMs with fused epilogues live in `vendor/csrc/gemm/fp4/` (vendored
   from FlashRT, never edited here) and are compiled alongside.
-- **ggml-facing half** (`fr_ggml.cuh`, `fr_dispatch.cu`): window
+- **ggml-facing half** (`src/fr_ggml.cuh`, `src/fr_dispatch.cu`): window
   predicates (`ggml_cuda_flashrt_should_fuse_*`) and executors that speak
   `ggml_tensor`, plus the caches. The host's `ggml-cuda.cu` calls the
   predicates from its fuse hook; that call-site code lives in the host
   tree, not here.
 
 Keep the boundary: nothing under `vendor/csrc/` or in the framework-free half
-may include ggml headers, and `fr_kernels.h` must stay consumable from a
+may include ggml headers, and `include/fr_kernels.h` must stay consumable from a
 plain C++ translation unit.
 
 ## Caches (all capture-safe)
@@ -41,16 +45,16 @@ memory) when growth would be needed mid-capture.
 
 ## Adding a fusion window
 
-1. Express the executor in the framework-free half with a C entry point
-   in `fr_kernels.h`; consume existing `csrc` GEMMs where possible.
-2. Add the predicate/executor pair to `fr_ggml.cuh` / `fr_dispatch.cu`.
+1. Express the executor in the framework-free half with a native launch entry point
+   in `include/fr_kernels.h`; consume existing `vendor/csrc/` GEMMs where possible.
+2. Add the predicate/executor pair to `src/fr_ggml.cuh` / `src/fr_dispatch.cu`.
    The predicate must pin every assumption the kernel makes: dtypes,
    shapes, strides (element-exact, not just "contiguous"), op params
    (`max_bias`, softcap), and use counts where the window elides
    intermediates.
 3. Add the call site to the host's fuse hook, and a
    `GGML_FLASHRT_NO_<NAME>` switch in the predicate.
-4. Validate per TESTING.md (trigger proof, A/B/A, parity or judge).
+4. Validate per [testing.md](testing.md) (trigger proof, A/B/A, parity or judge).
 
 Invariants and pitfalls learned the hard way:
 
@@ -74,7 +78,7 @@ Invariants and pitfalls learned the hard way:
   output plus a separate cast; a fused kernel writing the same values
   through the same conversion is bit-identical to the copy chain it
   replaces. Anything weaker goes through the real-observation judge.
-- **RoPE in `fr_qkv_post.cu` mirrors ggml's `rope_neox`** (yarn
+- **RoPE in `src/fr_qkv_post.cu` mirrors ggml's `rope_neox`** (yarn
   corrections included) and must stay bit-exact with it; the predicate
   rejects non-NEOX modes.
 - Windows only ever fire on `cc == 1100` (checked at the call site).
@@ -84,14 +88,14 @@ Invariants and pitfalls learned the hard way:
 `fa4_aot/` holds ahead-of-time exports of the vendored FA4 forward
 (vision shape: padded head_dim 80, MHA; prefill shape: head_dim 256, GQA
 with one KV head). Regeneration and the export mechanics are documented
-in `fa4_aot/README.md`; the short version:
+in [the FA4 guide](../fa4_aot/README.md); the short version:
 
 - CuTe-DSL's `export_to_c` emits a C header (host launch entry, tensor
   argument structs, embedded cubin) plus a host object. The tvm-ffi
   compile variant only exports a TVM ABI, so the export script strips
   `--enable-tvm-ffi` and never executes the resulting object in-process
   (its calling convention differs).
-- `fr_fa4_shims.c` supplies the small `_cuda*` runtime aliases the object
+- `src/fr_fa4_shims.c` supplies the small `_cuda*` runtime aliases the object
   expects, so neither the build nor the runtime depends on any CuTe-DSL
   library.
 - Module loading must happen outside CUDA graph capture; the adapter
@@ -107,7 +111,7 @@ in `fa4_aot/README.md`; the short version:
 ## Single-source rule
 
 Structure changes (GEMM tiles, epilogues, attention decompositions)
-belong in `csrc/` or the structures catalog so every host adapter
+belong in FlashRT's upstream `csrc/` or its catalog so every host adapter
 inherits them; this directory only translates. Nothing here may be
 copy-pasted into a host tree, and the host integration must stay behind
 its own opt-in build flag so stock builds are unaffected.

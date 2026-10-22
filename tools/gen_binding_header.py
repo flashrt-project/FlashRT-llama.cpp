@@ -112,7 +112,7 @@ def main() -> None:
     a("} // namespace frt_binding")
     a("")
 
-    out = _HERE.parent / f"fr_binding_{name.split('llamacpp_')[-1]}.h"
+    out = _HERE.parent / "src" / f"fr_binding_{name.split('llamacpp_')[-1]}.h"
     out.write_text("\n".join(lines))
     print(f"wrote {out} ({len(lines)} lines)")
 

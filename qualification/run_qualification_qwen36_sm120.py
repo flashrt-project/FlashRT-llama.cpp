@@ -80,7 +80,7 @@ def gate_pins() -> tuple[bool, str]:
 
 def gate_header() -> tuple[bool, str]:
     gen = _HERE.parent / "tools" / "gen_binding_header.py"
-    header = _HERE.parent / f"fr_binding_{BINDING.split('llamacpp_')[-1]}.h"
+    header = _HERE.parent / "src" / f"fr_binding_{BINDING.split('llamacpp_')[-1]}.h"
     if not header.is_file():
         return False, f"missing {header.name}"
     current = header.read_text()

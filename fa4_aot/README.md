@@ -2,14 +2,14 @@
 
 `fa4_siglip_fwd.h` / `fa4_siglip_fwd.o` are the CuTe-DSL ahead-of-time
 export of the vendored FA4 SM100-compatible forward
-(`csrc/attention/flash_attn_4_src/flashrt_fa4`) compiled for `sm_110a`
+(FlashRT upstream: `csrc/attention/flash_attn_4_src/flashrt_fa4`) compiled for `sm_110a`
 at head_dim 80 — the padded-head layout the ggml adapter's vision path
 uses. `fa4_prefill_fwd.h` / `fa4_prefill_fwd.o` are the same export at
 the pi0.5 prefill shape (head_dim 256, GQA with one KV head, full
 attention): the prefill's row-uniform pad mask is reproduced by passing
 the real sequence length as the KV dynamic shape. Sequence length, head count and batch stay dynamic; the softmax
 scale is a runtime argument. The `.o` contains the embedded cubin plus
-the host launch entry; `fr_fa4_shims.c` provides the small `_cuda*`
+the host launch entry; `src/fr_fa4_shims.c` provides the small `_cuda*`
 runtime aliases the object expects, so no CuTe-DSL runtime library is
 needed at build or run time.
 
@@ -21,11 +21,13 @@ back to the host's own flash attention per site.
 
 ## Regeneration
 
-Requires the `thor-fa4` runtime deps (`nvidia-cutlass-dsl`,
+Run from this repository's root. Set `FLASHRT_SOURCE` to a checkout of
+[FlashRT](https://github.com/flashrt-project/FlashRT), which supplies the FA4
+source and exporter integration. Requires the `thor-fa4` runtime deps (`nvidia-cutlass-dsl`,
 `quack-kernels`) and PyTorch with CUDA, on the target device:
 
 ```bash
-CUTE_DSL_ARCH=sm_110a python export_fa4_siglip.py
+FLASHRT_DIR="$FLASHRT_SOURCE" CUTE_DSL_ARCH=sm_110a python fa4_aot/export_fa4_siglip.py
 ```
 
 The script compiles the vendored FA4 forward once at the head_dim-80

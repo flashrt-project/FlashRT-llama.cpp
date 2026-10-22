@@ -1,20 +1,19 @@
-From 277d0c99c543f756adb357bd52e9b38321067850 Mon Sep 17 00:00:00 2001
+From 2eda9696fffbe5bf108e158197e25fc84de2957b Mon Sep 17 00:00:00 2001
 From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Wed, 21 Oct 2026 19:22:51 -0400
-Subject: [PATCH 2/8] ggml-cuda: optional FlashRT SM120 overlay
+Subject: [PATCH] ggml-cuda: optional FlashRT SM120 overlay
  (GGML_CUDA_FLASHRT_SM120)
 
 Fuse hook at the top of ggml_cuda_try_fuse and an eager pre-capture hook in
 graph compute; the overlay sources are compiled only when the CMake option
 is on. GGML_CUDA_FLASHRT_DISABLE=1 keeps the stock path at runtime.
-
 ---
  ggml/src/ggml-cuda/CMakeLists.txt | 22 ++++++++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda.cu   | 21 +++++++++++++++++++++
  2 files changed, 43 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
-index 297d9ff..c86f34c 100644
+index 297d9ff..f4959ee 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
 +++ b/ggml/src/ggml-cuda/CMakeLists.txt
 @@ -127,11 +127,33 @@ if (CUDAToolkit_FOUND)
@@ -30,10 +29,10 @@ index 297d9ff..c86f34c 100644
 +        else()
 +            set(FLASHRT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flashrt")
 +        endif()
-+        if (NOT EXISTS "${FLASHRT_DIR}/fr_win_flint_sm120.cu")
++        if (NOT EXISTS "${FLASHRT_DIR}/src/fr_win_flint_sm120.cu")
 +            message(FATAL_ERROR "GGML_CUDA_FLASHRT_SM120: FlashRT-llama.cpp overlay not found at ${FLASHRT_DIR} (git submodule update --init --recursive, or set GGML_CUDA_FLASHRT_DIR)")
 +        endif()
-+        set(FLASHRT_SM120_SOURCES ${FLASHRT_DIR}/fr_win_flint_sm120.cu)
++        set(FLASHRT_SM120_SOURCES ${FLASHRT_DIR}/src/fr_win_flint_sm120.cu)
 +        list(APPEND GGML_SOURCES_CUDA ${FLASHRT_SM120_SOURCES})
 +    endif()
 +
@@ -44,7 +43,7 @@ index 297d9ff..c86f34c 100644
  
 +    if (GGML_CUDA_FLASHRT_SM120)
 +        add_compile_definitions(GGML_CUDA_FLASHRT_SM120)
-+        target_include_directories(ggml-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${FLASHRT_DIR})
++        target_include_directories(ggml-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${FLASHRT_DIR} ${FLASHRT_DIR}/src ${FLASHRT_DIR}/include)
 +        message(STATUS "GGML_CUDA_FLASHRT_SM120: enabled (overlay at ${FLASHRT_DIR})")
 +    endif()
 +
