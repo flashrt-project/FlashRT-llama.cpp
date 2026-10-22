@@ -28,7 +28,8 @@ gates:
     route_moe_handoff: "FRT_STATS=1 reports moeffn act_q8=1"
     attndec_opt_in:                             # per-call max relative difference to ggml's kernel for the node
       vs_vec_f32_nkv_lt_8192: {median: 4.8e-7, max: 4.3e-6}
-      vs_mma_f16_nkv_ge_8192: {median: 5.6e-4, max: 4.2e-3}   # stock's own kernel there rounds Q, P to f16
+      vs_vec_f32_nkv_ge_8192: {median: 5.6e-7, max: 4.1e-6}   # FRT_ATTNDEC_CHECK_REF=vec
+      vs_stock_mma_f16_nkv_ge_8192: {median: 5.6e-4, max: 4.2e-3}   # stock's kernel there rounds Q, P to f16
       kld_code_c2048: 0.236
       stock_path_kld_reference: 0.239
   perf:                  # llama-bench, f16 KV, -fa on; d100k = median of 3 fresh processes

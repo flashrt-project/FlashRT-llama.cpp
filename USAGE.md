@@ -165,10 +165,10 @@ ggml's per-element arithmetic order; TESTING.md lists the coverage). The
 only non-bitwise component is the opt-in decode attention `FRT_ATTNDEC=1`
 (tensor-core GQA attention with f32-level operands), gated by
 perplexity/KLD against stock's own prefill-vs-decode variation. Per call
-it differs from ggml's f32 vector kernel by ~5e-7 relative (max 4e-6).
-From 8K cached tokens on, stock decode switches its full-attention layers
-to an f16 tensor-core kernel (GQA ratio > 4); the difference to that
-kernel is its f16 rounding of Q and P (~6e-4).
+it differs from ggml's f32 vector kernel by ~5e-7 relative (max 4e-6) at
+every cache length. From 8K cached tokens on, stock decode runs its
+full-attention layers on an f16 tensor-core kernel instead (GQA ratio >
+4), which differs from both by ~6e-4.
 
 | variable | effect |
 |---|---|
@@ -176,7 +176,7 @@ kernel is its f16 rounding of Q and P (~6e-4).
 | `GGML_FLASHRT_NO_{AMAX,ATTNQKV,ROUTE,OPROJ,MOEFFN,DENSEFFN,LMHEAD,MOETAILPF,GUGLUPF}=1` | disable one window (decode: AMAX, ATTNQKV, ROUTE, OPROJ, MOEFFN, DENSEFFN, LMHEAD; prefill: AMAX, MOETAILPF, GUGLUPF) |
 | `FRT_ATTNDEC=1` | opt-in decode attention (non-bitwise, see above); `FRT_ATTNDEC_QKN=0` keeps the separate head-norm kernel, `FRT_ATTNDEC_MAX_TILES=<n>` (default 1280 = ~80K rows) hands longer caches back to ggml |
 | `FRT_NW_{QKV,OPROJ,GU,DOWN,ROUTE,DGU,DDOWN,LMHEAD}=4\|8\|16` | warps per CTA of the GEMV windows (defaults from a shape search) |
-| `FRT_ATTNDEC_CHECK=<k>` | test aid: every k-th ATTNDEC call is compared against ggml's kernel (eager mode only, `GGML_CUDA_DISABLE_GRAPHS=1`) |
+| `FRT_ATTNDEC_CHECK=<k>` | test aid: every k-th ATTNDEC call is compared against ggml's kernel (eager mode only, `GGML_CUDA_DISABLE_GRAPHS=1`); `FRT_ATTNDEC_CHECK_REF=vec` compares against ggml's f32 vector kernel at every cache length |
 | `FRT_PF_CHECK=1` | test aid: the prefill MoE tail window compares against ggml's own execution (eager mode) |
 | `FRT_STATS=1`, `FRT_DUMP_GRAPH=1` + `FRT_DUMP_M=<m>` (+ `FRT_DUMP_PATH`) | diagnostics |
 

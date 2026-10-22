@@ -38,11 +38,12 @@ Recommended serving flags and the runtime switches are in `../../USAGE.md`.
 ## Numerics
 
 The default path is exact: decode and prefill logits are bit-identical to
-stock llama.cpp at the same `-ub` (FNV-1a hash of every position's logits:
-1024 decode positions; ~100K decode positions on a code corpus; 4096 decode
-positions with a 4096-ubatch context; 8192 prefill tokens at `-ub 2048`
-and `-ub 4096`, the latter against the unmodified stock build). Real-prompt
-greedy outputs are token-identical to stock. The opt-in decode attention
+stock llama.cpp at the same `-ub`, checked against the unmodified stock
+build with an FNV-1a hash of every position's logits: 1024 decode
+positions; 99,673 decode positions on a code corpus; 4096 decode positions
+with a 4096-ubatch context; 8192 prefill tokens at `-ub` 512, 2048, 4096,
+8192 and 3000 (a partial last ubatch); 512 prefill tokens at ubatches of
+2, 4, 8 and 32. Real-prompt greedy outputs are token-identical to stock. The opt-in decode attention
 (`FRT_ATTNDEC=1`) is the only non-bitwise component; its quality is gated
 against stock's own path variation (below).
 
@@ -62,11 +63,13 @@ not depend on `-ub`, within 0.5%):
 | stock | 242.1 | 236.2 | 228.4 | 227.1 | 219.3 | 205.3 | 182.3 | 162.0 |
 | FlashRT | 550.1 | 534.9 | 501.6 | 489.8 | 454.3 | 398.2 | 320.6 | 264.9 |
 | speedup | 2.27x | 2.26x | 2.20x | 2.16x | 2.07x | 1.94x | 1.76x | 1.64x |
-| `FRT_ATTNDEC=1` | 548.0 | 548.2 | 528.3 | 510.8 | 471.3 | 408.9 | 322.0 | 263.2 |
+| `FRT_ATTNDEC=1` | 548.0 | 548.2 | 528.3 | 510.8 | 471.3 | 408.9 | 322.0 | 264.8 |
 
 The 100K column is the median of three fresh processes (stock 161.8 /
-162.0 / 162.1, FlashRT 264.6 / 264.9 / 265.1). Inside one process that
-sweeps all depths in turn, stock measures 151.4 at 100K and FlashRT 265.3.
+162.0 / 162.1, FlashRT 264.6 / 264.9 / 265.1, `FRT_ATTNDEC=1` 264.7 /
+264.8 / 264.9; it hands caches above ~80K rows back to ggml). Inside one
+process that sweeps all depths in turn, stock measures 151.4 at 100K,
+FlashRT 265.3 and `FRT_ATTNDEC=1` 263.2.
 
 Prefill, `llama-bench` pp at depth 0 (tok/s):
 
@@ -96,9 +99,10 @@ after the prompt, median of 2 requests (≤32K after one warm-up request):
 | 65,523 | 11.9 s | 7.30 s | 5.91 s | 173 | 291 |
 | 99,994 | 21.0 s | 13.1 s | 11.1 s | 157 | 249 |
 
-With `--backend-sampling` (FlashRT `-ub 4096`, 1K–32K): TTFT within 6 ms
-of CPU sampling (0.25 / 0.69 / 2.51 s at 1K / 8K / 32K without patch
-0008), decode 501 / 460 / 451 / 418 / 371 tok/s, identical greedy outputs.
+With `--backend-sampling` (FlashRT `-ub 4096`, 1K–32K): TTFT within 9 ms
+(0.4%) of CPU sampling, decode 501 / 460 / 451 / 418 / 371 tok/s,
+identical greedy outputs. Without patch 0008 (`LLAMA_SCHED_RESERVE_NEW=1`,
+A/B/A on the same build) TTFT was 0.25 / 0.69 / 2.51 s at 1K / 8K / 32K.
 
 Real-suite decode (8 coding/agent prompts of 57–12,725 tokens, 512 greedy
 tokens, stock / FlashRT / stock server processes, both at the default
@@ -109,10 +113,9 @@ to stock in every leg.
 100K context, batch 1: 3.78 ms per decoded token in `llama-bench` (stock
 6.17 ms) and 4.02 ms served with CPU sampling (stock 6.36 ms); in an nsys
 profile of the same decode kernels the model forward without the LM head
-takes 3.51 ms (stock 5.95 ms). An 8,192-token prefill on top of 92K cached
-tokens takes 1.37 s (stock 2.32 s at `-ub 512`, 1.58 s at `-ub 4096`); at
-that depth the full-attention layers dominate and run near the
-tensor-core rate of the card. Device memory in use (nvml, sampled every
+takes 3.51 ms (stock 5.94 ms). An 8,192-token prefill on top of 92K cached
+tokens takes 1.37 s (stock 2.32 s at `-ub 512`, 1.58 s at `-ub 4096`).
+Device memory in use (nvml, sampled every
 0.2 s) peaks at 27,349 MiB while serving the 100K prompt with a 104K
 context at `-ub 4096` (stock at most 27,175 MiB; both include the ~0.5 GiB
 in use before the server starts).
@@ -131,7 +134,7 @@ prompts are well-formed in all variants.
 ## Remaining headroom
 
 - Short-context decode: at depth 0 the GPU spends 1.77 ms per token against
-  ~0.85 ms to stream the active weights once at full DRAM bandwidth. Each
+  ~0.81 ms to stream the ~1.45 GB of active weights once at 1.79 TB/s. Each
   MoE layer is a chain of 9 dependent kernels (~34 µs): the four GEMV
   windows reach 0.8–1.5 TB/s, and the links between them (head norm and
   RoPE, attention, combine, routing, GLU quantization) are latency-bound.
