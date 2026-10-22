@@ -19,11 +19,13 @@ Documentation: [USAGE.md](USAGE.md) · [TESTING.md](TESTING.md) · [DEVELOPMENT.
 Measured: pi0.5 on Jetson AGX Thor **202.7 → 35.5 ms** (5.7×, 2 views,
 `llama_encode` + `llama_decode` P50 warm); Qwen3.6-35B-A3B on RTX 5090
 **283 → 368 tok/s** decode on a stock Q4_K_M GGUF, 433–444 with
-speculative decoding; Recursive Flint on RTX 5090 (official NVFP4 GGUF,
-M = 1 windows bit-identical to stock) **242 → 550 tok/s** decode at
-empty context and 162 → 265 at 100K, 8K-token prefill 12.0K → 16.4K tok/s
-at the same `-ub 4096` (stock's default `-ub 512`: 7.2K). Receipts and
-protocol in TESTING.md and the hosts' READMEs.
+speculative decoding. Recursive Flint on RTX 5090 (official NVFP4 GGUF),
+matched decode-only benchmark at 1K prompt / 1K decode tokens per sequence:
+**230.5 → 517.4 tok/s** at batch 1 (2.24x) and
+**1625.8 → 2482.7 tok/s** at batch 64 (1.53x).
+Stock, FlashRT, speedups and the common protocol are tabulated in
+`hosts/llama.cpp-flint/README.md`, with prefill reported separately;
+correctness gates are in TESTING.md.
 
 ## What it is
 

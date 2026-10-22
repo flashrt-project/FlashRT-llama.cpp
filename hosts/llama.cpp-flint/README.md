@@ -49,172 +49,74 @@ with a 4096-ubatch context; 8192 prefill tokens at `-ub` 512, 2048, 4096,
 8192 and 3000 (a partial last ubatch); 512 prefill tokens at ubatches of
 2, 4, 8 and 32. Real-prompt greedy outputs are token-identical to stock. The opt-in decode attention
 (`FRT_ATTNDEC=1`) is non-bitwise; its quality is gated against stock's own
-path variation (below). The default batched windows also change fp32
+path variation (see `../../TESTING.md`). The default batched windows also change fp32
 summation order and use the sampled double-precision host-reference gate
 in `../../TESTING.md`.
 
-## Measurements (RTX 5090, CUDA 13.0, f16 KV, `-fa on`, clocks not locked, GPU otherwise idle)
+## Decode throughput
 
-The following tables record the original M = 1 implementation before the
-batched windows. They are historical reference measurements; current
-batched measurements and reproduction commands follow below.
+| Parallel sequences | Stock decode tok/s | FlashRT decode tok/s | Speedup | Improvement |
+|---:|---:|---:|---:|---:|
+| 1 | 230.5 | 517.4 | 2.24x | +124.5% |
+| 8 | 1018.9 | 1459.2 | 1.43x | +43.2% |
+| 16 | 924.0 | 1654.3 | 1.79x | +79.0% |
+| 32 | 1301.4 | 2103.3 | 1.62x | +61.6% |
+| 64 | 1625.8 | 2482.7 | 1.53x | +52.7% |
 
-Stock = unmodified llama.cpp at the pin (default `-ub 512`); FlashRT =
-this host + overlay. Prefill and decode are reported separately; "served"
-numbers are llama-server, cache-cold (`cache_prompt: false`), CPU
-sampling, one request at a time.
+Metric: aggregate decode throughput = `parallel_sequences * 1000 / t_tg`, the `speed_tg` (`S_TG t/s`) field from `llama-batched-bench`. Prompt processing is outside this timer.
 
-Decode, `llama-bench` tg128 at populated KV depth (tok/s, median of 6;
-FlashRT at `-ub 4096`, stock at its default `-ub 512`; FlashRT decode does
-not depend on `-ub`, within 0.5%):
+## Prefill throughput
 
-| depth | 0 | 1K | 4K | 8K | 16K | 32K | 64K | 100K |
-|---|---|---|---|---|---|---|---|---|
-| stock | 242.1 | 236.2 | 228.4 | 227.1 | 219.3 | 205.3 | 182.3 | 162.0 |
-| FlashRT | 550.1 | 534.9 | 501.6 | 489.8 | 454.3 | 398.2 | 320.6 | 264.9 |
-| speedup | 2.27x | 2.26x | 2.20x | 2.16x | 2.07x | 1.94x | 1.76x | 1.64x |
-| `FRT_ATTNDEC=1` | 548.0 | 548.2 | 528.3 | 510.8 | 471.3 | 408.9 | 322.0 | 264.8 |
+| Parallel sequences | Stock prefill tok/s | FlashRT prefill tok/s | Speedup | Improvement |
+|---:|---:|---:|---:|---:|
+| 1 | 4981.5 | 5450.7 | 1.09x | +9.4% |
+| 8 | 6438.3 | 7261.8 | 1.13x | +12.8% |
+| 16 | 6365.6 | 7184.3 | 1.13x | +12.9% |
+| 32 | 6339.7 | 7148.3 | 1.13x | +12.8% |
+| 64 | 6319.0 | 7124.0 | 1.13x | +12.7% |
 
-The 100K column is the median of three fresh processes (stock 161.8 /
-162.0 / 162.1, FlashRT 264.6 / 264.9 / 265.1, `FRT_ATTNDEC=1` 264.7 /
-264.8 / 264.9; it hands caches above ~80K rows back to ggml). Inside one
-process that sweeps all depths in turn, stock measures 151.4 at 100K,
-FlashRT 265.3 and `FRT_ATTNDEC=1` 263.2.
+Aggregate prefill throughput = `parallel_sequences * 1000 / t_pp`, the `speed_pp` (`S_PP t/s`) field from the same runs. Prefill and decode use their own measured times; all parameters are identical between the two builds.
 
-Prefill, `llama-bench` pp at depth 0 (tok/s):
+RTX 5090, CUDA 13.0, Release, SM120, the same official Flint NVFP4 GGUF, f16 KV, Flash Attention on, CUDA graphs at their defaults, 8 CPU threads. Fixed batches with random decode token IDs: each sequence has 1,000 prompt tokens followed by 1,000 decode steps; KV depth grows from 1,000 to 2,000 tokens during decode. Each cell is the median of two fresh processes, run in stock / FlashRT / FlashRT / stock order.
 
-| prompt | 1K | 4K | 8K | 16K | 32K | 64K |
-|---|---|---|---|---|---|---|
-| stock `-ub 512` (default) | 7640 | 7320 | 7219 | 7045 | 6667 | 5852 |
-| stock `-ub 4096` | 10680 | 11855 | 11990 | 11697 | 10808 | 9142 |
-| FlashRT `-ub 4096` | 12336 | 16506 | 16419 | 15723 | 14055 | 11256 |
-| FlashRT vs stock, both `-ub 4096` | 1.16x | 1.39x | 1.37x | 1.34x | 1.30x | 1.23x |
+Baseline: llama.cpp at `1b44e30775dcb2f93952116b05f89e5bd797fb00` with only patch 0001 (Jinja compatibility); CUDA and scheduler are stock. FlashRT: the same pin with patches 0001–0009 and this overlay.
 
-Most of the gain over stock's default comes from the larger ubatch, which
-stock can use as well; the kernel gain at the same ubatch is the last row.
-FlashRT at `-ub 512` runs 8483 / 7920 / 6283 tok/s at 1K / 8K / 64K.
+The 64-sequence sweep needs 128,000 KV cells, so both builds use
+`-c 131072`. All results use the same workload, with the prefill and decode
+phases timed separately.
 
-Served, real-code agent prompts (token counts checked against the
-server's `prompt_n`), cache-cold, CPU sampling, 128 (≤32K) or 256
-(64K/100K) decode tokens; time to first token (TTFT) and the decode rate
-after the prompt, median of 2 requests (≤32K after one warm-up request):
-
-| prompt tokens | stock `-ub 512` TTFT | stock `-ub 4096` TTFT | FlashRT `-ub 4096` TTFT | stock `-ub 512` decode | FlashRT decode |
-|---|---|---|---|---|---|
-| 1,022 | 0.18 s | 0.13 s | 0.12 s | 221 tok/s | 467 tok/s |
-| 4,089 | 0.63 s | 0.37 s | 0.28 s | 212 | 420 |
-| 8,188 | 1.25 s | 0.76 s | 0.56 s | 209 | 409 |
-| 16,371 | 2.51 s | 1.48 s | 1.10 s | 204 | 397 |
-| 32,765 | 5.31 s | 3.12 s | 2.39 s | 194 | 348 |
-| 65,523 | 11.9 s | 7.30 s | 5.91 s | 173 | 291 |
-| 99,994 | 21.0 s | 13.1 s | 11.1 s | 157 | 249 |
-
-With `--backend-sampling` (FlashRT `-ub 4096`, 1K–32K): TTFT within 9 ms
-(0.4%) of CPU sampling, decode 501 / 460 / 451 / 418 / 371 tok/s,
-identical greedy outputs. Without patch 0008 (`LLAMA_SCHED_RESERVE_NEW=1`,
-A/B/A on the same build) TTFT was 0.25 / 0.69 / 2.51 s at 1K / 8K / 32K.
-
-Real-suite decode (8 coding/agent prompts of 57–12,725 tokens, 512 greedy
-tokens, stock / FlashRT / stock server processes, both at the default
-`-ub 512`): 220.4 → 457.9 tok/s geomean (2.08x) with CPU sampling and
-224.4 → 491.7 (2.19x) with `--backend-sampling` on both; tokens identical
-to stock in every leg.
-
-100K context, batch 1: 3.78 ms per decoded token in `llama-bench` (stock
-6.17 ms) and 4.02 ms served with CPU sampling (stock 6.36 ms); in an nsys
-profile of the same decode kernels the model forward without the LM head
-takes 3.51 ms (stock 5.94 ms). An 8,192-token prefill on top of 92K cached
-tokens takes 1.37 s (stock 2.32 s at `-ub 512`, 1.58 s at `-ub 4096`).
-Device memory in use (nvml, sampled every
-0.2 s) peaks at 27,349 MiB while serving the 100K prompt with a 104K
-context at `-ub 4096` (stock at most 27,175 MiB; both include the ~0.5 GiB
-in use before the server starts).
-
-Quality: perplexity is unchanged by construction (exact path); `-ub 4096`
-vs `-ub 512` (different stock numerics) at 4K context: wikitext 17.098 vs
-17.068, code 6.168 vs 6.291. HumanEval pass@1 (164, greedy): stock at its
-default `-ub 512` 72.6%, FlashRT at `-ub 4096` 72.6% (161/164 identical
-completions; the two differ only by the ubatch); stock numerics with
-32-token prompt ubatches (run on FlashRT, which is bit-identical to stock
-at that ubatch) 67.7%; `FRT_ATTNDEC=1` 68.3%. This model's greedy outputs
-diverge under any numeric perturbation, so only stock's own path variation
-is a meaningful reference for non-exact options. Tool calls in agent
-prompts are well-formed in all variants.
-
-## Remaining headroom
-
-- Short-context decode: at depth 0 the GPU spends 1.77 ms per token against
-  ~0.81 ms to stream the ~1.45 GB of active weights once at 1.79 TB/s. Each
-  MoE layer is a chain of 9 dependent kernels (~34 µs): the four GEMV
-  windows reach 0.8–1.5 TB/s, and the links between them (head norm and
-  RoPE, attention, combine, routing, GLU quantization) are latency-bound.
-  Most of the gap is fixed per-kernel latency, so closing it needs fusion
-  across dependent stages (a persistent layer kernel with cheap grid
-  synchronization; a first attempt with a single-counter barrier was 7%
-  slower).
-- MoE GEMMs in prefill (stock MMQ, W4A8): at 4096-token ubatches the
-  routed gate/up GEMMs run at ~89 TOPS and the down GEMM at ~49 TOPS,
-  against ~240 TOPS for the dense projections. At dense efficiency they
-  would remove about 30% of an 8K prefill. That needs a MoE-specific
-  grouped GEMM for ~100 tokens per expert; picking the MMQ tile from the
-  per-expert token count was slower.
-- Host time per decoded token (sampling, token round trip, graph launch)
-  is not overlapped with the GPU: served decode with CPU sampling takes
-  ~0.3 ms per token more than the GPU step. `--backend-sampling` removes
-  most of the sampling share; the rest needs a GPU-resident decode loop.
-
-## Batched decode
-
-The default windows handle 2–128 tokens with int8 tensor-core dot products,
-expert grouping and multi-sequence decode attention (up to 32 sequences by
-default). Larger prefills and small MoE batches use stock kernels; the
-persistent and TMA ring variants are opt-in. See `../../USAGE.md` for caps,
-diagnostics and the one-active-context-per-GPU requirement.
-
-Review rerun on RTX 5090, CUDA 13.0, f16 KV, `-fa on`, 1,000 prompt tokens
-and 1,000 decode steps per sequence, default four CPU threads, two fresh
-processes (aggregate decode tok/s; median of two is their mean):
-
-| sequences | run 1 | run 2 | median |
-|---:|---:|---:|---:|
-| 1 | 520.24 | 518.00 | 519.12 |
-| 8 | 1463.63 | 1459.74 | 1461.69 |
-| 16 | 1659.80 | 1654.39 | 1657.10 |
-| 32 | 2104.19 | 2103.09 | 2103.64 |
-| 64 | 2482.22 | 2481.48 | 2481.85 |
-
-HTTP serving was checked separately with 64 concurrent requests, 128
-requests per round, 1,000 input and 1,000 output tokens, streaming sampled
-generation, f16 KV and `-c 131072 -np 64 -b 2048 -ub 512 -t 8`.
-With `--backend-sampling --samplers "top_k;top_p;min_p;temperature"
---threads-http 16 --ctx-checkpoints 0`, two rounds completed all requests
-at 1459.97 and 1440.67 output tok/s. These are end-to-end rates, including
-prefill and HTTP overhead, rather than the batched-bench decode rate.
-
-Build from the pin with all nine patches, then run from the host checkout
-(`MODEL` is the official Flint NVFP4 GGUF and `TEXT` is the test corpus):
+Set `MODEL` to the GGUF, `STOCK_BIN` to the stock `llama-batched-bench`, and
+`FLASHRT_BIN` to the binary produced by this host's `build.sh`, then run:
 
 ```bash
-for ub in 8 24 64; do
-  GGML_CUDA_DISABLE_GRAPHS=1 FRT_B_HREF=1 ./build/bin/llama-perplexity \
-    -m "$MODEL" -ngl 99 -fa on -ctk f16 -ctv f16 -c 2048 --chunks 1 \
-    -b 2048 -ub "$ub" -f "$TEXT"
-done
-
-GGML_CUDA_DISABLE_GRAPHS=1 FRT_ATTNDEC_CHECK=8 FRT_ATTNDEC_CHECK_REF=vec \
-  FRT_B_ATTN_MAX_SEQ=64 ./build/bin/llama-batched-bench \
-    -m "$MODEL" -ngl 99 -fa on -ctk f16 -ctv f16 -c 131072 -b 2048 -ub 512 \
-    -npp 300 -ntg 32 -npl 8,64
-
-for rep in 1 2; do
-  ./build/bin/llama-batched-bench -m "$MODEL" -ngl 99 -fa on -ctk f16 -ctv f16 \
-    -c 131072 -b 2048 -ub 512 -npp 1000 -ntg 1000 -npl 1,8,16,32,64
+for bench in "$STOCK_BIN" "$FLASHRT_BIN" "$FLASHRT_BIN" "$STOCK_BIN"; do
+  "$bench" -m "$MODEL" -ngl 99 -fa on -ctk f16 -ctv f16 -t 8 \
+    -c 131072 -b 2048 -ub 512 -npp 1000 -ntg 1000 -npl 1,8,16,32,64 \
+    --output-format jsonl
 done
 ```
 
-The review host-reference runs at ubatches 8/24/64 report `bad 0` for all
-sampled windows. Raw host/device q8 rounding differences are checked as
-documented in `../../TESTING.md`; batched output is not claimed bit-exact.
-The forced 64-sequence attention run also checks the kernel beyond its
-default sequence cap. Throughput is a benchmark result, separate from HTTP
-serving, where the sampling chain and context checkpoints affect the rate.
+Build the baseline from the same pin with only
+`patches/0001-common-jinja-hexadecimal-escapes-upstream-PR-30929-5.patch`.
+Configure both builds with `-DGGML_CUDA=ON
+-DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF`;
+only the FlashRT build enables `GGML_CUDA_FLASHRT_SM120` and adds patches
+0002–0009. The baseline's Jinja backport changes template parsing, not the
+decode kernels.
+
+## Validation
+
+| Check | Result |
+|---|---|
+| Fresh host build, pinned base + patches 0001–0009 | Pass; server, CLI, perplexity, bench and batched-bench built |
+| Host-reference checks, ubatches 8 / 24 / 64 | 168 window/partial reports, all `bad 0`; zero unexplained q8 or scale mismatches |
+| Attention vs ggml f32 vector reference, 8 / 64 sequences | Max relative difference `2.42e-6` |
+| Reference-helper boundary and NaN/Inf regression cases | Pass |
+| Existing Qwen patches, whitespace and privacy scans | Pass |
+
+The default windows handle 2–128 tokens with int8 tensor-core dot products,
+expert grouping and multi-sequence decode attention (up to 32 sequences by
+default). See `../../USAGE.md` for caps, switches and the
+one-active-context-per-GPU requirement. Batched output is not claimed
+bit-exact; numerical tolerances, sampling coverage and correctness commands
+are specified in `../../TESTING.md`.

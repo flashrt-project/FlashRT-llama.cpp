@@ -150,9 +150,16 @@ FRT_ATTNDEC_CHECK_REF=vec FRT_B_ATTN_MAX_SEQ=64` on `llama-batched-bench`
 forces coverage of 64 sequences, beyond the default cap of 32, and reports
 the sampled per-call difference against
 ggml's f32 vector kernel (review rerun max rel 2.42e-6 at 8 and 64 sequences).
-Throughput: `llama-batched-bench -npp 1000 -ntg 1000 -npl 1,8,16,32,64`
-(fixed batches, random decode tokens), two fresh processes, median; the
-served number is a separate `llama-server` run and is reported separately.
+Prefill and decode throughput: compare stock and FlashRT with the same
+`llama-batched-bench` parameters, `-t 8 -npp 1000 -ntg 1000
+-npl 1,8,16,32,64` (fixed batches, random decode tokens). Run two fresh
+processes per build in stock / FlashRT / FlashRT / stock order and report
+the median `speed_tg` (`S_TG t/s`): aggregate generated tokens divided by
+`t_tg`, with prompt processing outside the timer. Also report median
+`speed_pp` (`S_PP t/s`): aggregate prompt tokens divided by `t_pp`. Keep the
+two phases in separate tables, each with stock, FlashRT, speedup and
+percentage improvement; the matched results and full
+command are in `hosts/llama.cpp-flint/README.md`.
 
 Use `-c 131072 -b 2048 -ub 512 -npp 1000 -ntg 1000 -npl 1,8,16,32,64`
 for that throughput sweep: 64 independent sequences need 128,000 KV cells
