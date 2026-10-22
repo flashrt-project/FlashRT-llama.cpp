@@ -17,6 +17,10 @@
 #include "mmq.cuh"
 #include "mmvq.cuh"
 
+// ggml's vector flash-attention kernel (fattn-vec.cuh; explicit instances in template-instances/)
+template <int D, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 #include <algorithm>
 #include <vector>
 #include <cstdint>
@@ -2721,7 +2725,14 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
         (const frt_fa_part *) g_fa_ml, (const float *) g_fa_o, pl.sinks ? (const float *) pl.sinks->data : (const float *) nullptr,
         chk ? chk : (float *) fa->data, (int64_t) (fa->nb[1] / sizeof(float)), n_split);
     if (chk) {
-        ggml_cuda_flash_attn_ext(ctx, fa);
+        // reference: ggml's own kernel choice, or (FRT_ATTNDEC_CHECK_REF=vec) always its f32 vector kernel,
+        // which stock skips for GQA > 4 from 8K cached tokens in favour of the f16 tensor-core kernel
+        static const bool ref_vec = getenv("FRT_ATTNDEC_CHECK_REF") && !strcmp(getenv("FRT_ATTNDEC_CHECK_REF"), "vec");
+        if (ref_vec) {
+            ggml_cuda_flash_attn_ext_vec_case<FRT_FA_D, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, fa);
+        } else {
+            ggml_cuda_flash_attn_ext(ctx, fa);
+        }
         CUDA_CHECK(cudaStreamSynchronize(stream));
         std::vector<float> a(ggml_nelements(fa)), b(ggml_nelements(fa));
         CUDA_CHECK(cudaMemcpy(a.data(), chk, ggml_nbytes(fa), cudaMemcpyDeviceToHost));
