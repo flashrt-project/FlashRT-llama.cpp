@@ -14,6 +14,8 @@
 #include "ggml-impl.h"
 #include "vecdotq.cuh"
 #include "unary.cuh"
+#include "mmq.cuh"
+#include "mmvq.cuh"
 
 #include <algorithm>
 #include <vector>
@@ -1177,6 +1179,199 @@ static bool frt_lmhead_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
             (const block_q8_1 *) g_lm_q8, (const char *) w->data, (size_t) w->nb[1], (const float *) s->data,
             (float *) smul->data, n_rows, 0.0f));
     *skip_count = 4;
+    return true;
+}
+
+// ---- prefill MoE tail (FRT window MOETAILPF, M > 1) --------------------------
+// Routed down output x [n_embd, n_used, T] -> per-slot expert scale, rescale e
+// and routing weight (one fused stock MUL), sum over slots (fused ADD chain);
+// then the shared expert: gate / up MMQ (stock kernels) -> scales -> SwiGLU ->
+// down MMQ -> scale -> + routed sum -> + residual. The elementwise stages are
+// folded into 3 kernels with stock arithmetic order; the GEMMs stay ggml's.
+
+static float * g_pf_moe = nullptr;   // routed sum [n_embd, T], private (x may share its buffer)
+// FRT_PF_CHECK=1 (eager test aid): compute into private buffers, let ggml run the nodes, compare at the next node
+struct frt_pf_check_state { const ggml_tensor * lo = nullptr; float * mine_out = nullptr, * pg = nullptr, * pu = nullptr, * pglu = nullptr, * pd = nullptr; int64_t n = 0; };
+static frt_pf_check_state g_pf_chk;
+static constexpr int64_t FRT_PF_TOKENS_MAX = 8192;
+
+// moe[t][r] = sum_k ((x[t][k][r] * s[ids[t][k]]) * e[t][k]) * w[t][k], k ascending.
+// ggml runs the products and the sum as separate kernels: __fmul_rn / __fadd_rn keep the
+// compiler from contracting them into FMAs here.
+template <int NU>
+static __global__ void __launch_bounds__(256) frt_pf_moe_sum(
+        const float * x, const int32_t * ids, const int64_t ids_stride, const float * scale,
+        const float * e, const float * w, float * out, const int n_embd) {
+    const int t = blockIdx.y;
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float se[NU], ee[NU], we[NU];
+    if (threadIdx.x < NU) {
+        se[threadIdx.x] = scale[ids[t * ids_stride + threadIdx.x]];
+        ee[threadIdx.x] = e[t * NU + threadIdx.x];
+        we[threadIdx.x] = w[t * NU + threadIdx.x];
+    }
+    __syncthreads();
+    if (r >= n_embd) {
+        return;
+    }
+    const float * xt = x + (int64_t) t * NU * n_embd + r;
+    float m[NU];
+#pragma unroll
+    for (int k = 0; k < NU; ++k) {
+        m[k] = xt[(int64_t) k * n_embd];
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < NU; ++k) {
+        float v = m[k];
+        v = __fmul_rn(v, se[k]);
+        v = __fmul_rn(v, ee[k]);
+        v = __fmul_rn(v, we[k]);
+        sum = k == 0 ? v : __fadd_rn(sum, v);
+    }
+    out[(int64_t) t * n_embd + r] = sum;
+}
+
+// glu = silu(g * sg) * (u * su), element-wise (out may alias g or u exactly)
+static __global__ void frt_pf_glu(const float * g, const float * u, const float * sg, const float * su, float * out, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float gs = __fmul_rn(g[i], sg[0]);
+    const float us = __fmul_rn(u[i], su[0]);
+    out[i] = ggml_cuda_op_silu_single(gs) * us;
+}
+
+// out = (moe + d * sd) + resid, element-wise
+static __global__ void frt_pf_out(const float * moe, const float * d, const float * sd, const float * resid, float * out, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float sh = __fmul_rn(d[i], sd[0]);
+    out[i] = __fadd_rn(__fadd_rn(moe[i], sh), resid[i]);
+}
+
+static bool frt_f32_rows(const ggml_tensor * t, const int64_t ne0, const int64_t ne1) {
+    return t->type == GGML_TYPE_F32 && t->ne[0] == ne0 && ggml_nrows(t) == ne1 && ggml_is_contiguous(t);
+}
+
+// anchor: REPEAT(scale of ffn_down_exps) at M > 1 (the reshape before it is a view)
+static bool frt_moetailpf_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
+    static const bool on = frt_window_on("GGML_FLASHRT_NO_MOETAILPF");
+    if (!on || g_pf_moe == nullptr || i + 24 >= cgraph->n_nodes) return false;
+    ggml_tensor * const * n = cgraph->nodes + i;
+    const ggml_tensor * rep = n[0], * gr = n[1], * m1 = n[2], * m2 = n[3], * m3 = n[4];
+    if (rep->op != GGML_OP_REPEAT || gr->op != GGML_OP_GET_ROWS || gr->src[0] != rep) return false;
+    const ggml_tensor * sc = rep->src[0]->op == GGML_OP_RESHAPE ? rep->src[0]->src[0] : rep->src[0];
+    if (!strstr(sc->name, ".ffn_down_exps.scale") || sc->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc)) return false;
+    if (m1->op != GGML_OP_MUL || m1->src[1] != gr || m2->op != GGML_OP_MUL || m2->src[0] != m1 || m3->op != GGML_OP_MUL || m3->src[0] != m2) return false;
+    const ggml_tensor * x = m1->src[0], * ids = gr->src[1], * ev = m2->src[1], * wv = m3->src[1];
+    if (x->op != GGML_OP_MUL_MAT_ID || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) return false;
+    const int64_t n_embd = x->ne[0], n_used = x->ne[1], T = x->ne[2];
+    if (T <= 1 || T > FRT_PF_TOKENS_MAX || n_used != 6 || n_embd != FRT_K_EMBD || n_embd % 256 != 0) return false;
+    if (ids->type != GGML_TYPE_I32 || ids->ne[0] != n_used || ids->ne[1] != T || ids->nb[0] != sizeof(int32_t) || x->src[2] != ids) return false;
+    if (!ggml_is_contiguous(ev) || ev->type != GGML_TYPE_F32 || ggml_nelements(ev) != n_used * T) return false;
+    if (!ggml_is_contiguous(wv) || wv->type != GGML_TYPE_F32 || ggml_nelements(wv) != n_used * T) return false;
+    // six views of the weighted slots and the fused ADD chain
+    for (int k = 0; k < 6; ++k) {
+        const ggml_tensor * v = n[5 + k];
+        if (v->op != GGML_OP_VIEW || v->src[0] != m3 || v->view_offs != (size_t) k * n_embd * sizeof(float) ||
+            v->ne[0] != n_embd || v->ne[1] != T || v->nb[1] != m3->nb[2]) return false;
+    }
+    const ggml_tensor * a = n[11];
+    if (a->op != GGML_OP_ADD || a->src[0] != n[5] || a->src[1] != n[6]) return false;
+    for (int k = 1; k < 5; ++k) {
+        const ggml_tensor * ak = n[11 + k];
+        if (ak->op != GGML_OP_ADD || ak->src[0] != n[10 + k] || ak->src[1] != n[6 + k]) return false;
+    }
+    const ggml_tensor * moe_out = n[15];
+    // shared expert
+    const ggml_tensor * gmm = n[16], * gsm = n[17], * umm = n[18], * usm = n[19], * glu = n[20], * dmm = n[21], * dsm = n[22];
+    ggml_tensor * fo = n[23], * lo = n[24];
+    if (gmm->op != GGML_OP_MUL_MAT || !strstr(gmm->src[0]->name, ".ffn_gate_shexp.weight")) return false;
+    if (umm->op != GGML_OP_MUL_MAT || !strstr(umm->src[0]->name, ".ffn_up_shexp.weight") || umm->src[1] != gmm->src[1]) return false;
+    if (dmm->op != GGML_OP_MUL_MAT || !strstr(dmm->src[0]->name, ".ffn_down_shexp.weight") || dmm->src[1] != glu) return false;
+    const ggml_tensor * sg = frt_mm_scale_src(gsm, gmm), * su = frt_mm_scale_src(usm, umm), * sd = frt_mm_scale_src(dsm, dmm);
+    if (!sg || !su || !sd) return false;
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->src[0] != gsm || glu->src[1] != usm) return false;
+    if (fo->op != GGML_OP_ADD || fo->src[0] != moe_out || fo->src[1] != dsm) return false;
+    if (lo->op != GGML_OP_ADD || lo->src[0] != fo) return false;
+    const ggml_tensor * resid = lo->src[1];
+    const ggml_tensor * act = gmm->src[1];
+    const int64_t n_ff_sh = gmm->src[0]->ne[1];
+    for (const ggml_tensor * w : { gmm->src[0], umm->src[0], dmm->src[0] }) {
+        if (w->type != GGML_TYPE_NVFP4 || !ggml_is_contiguous(w)) return false;
+    }
+    if (!frt_f32_rows(act, n_embd, T) || !frt_f32_rows(gmm, n_ff_sh, T) || !frt_f32_rows(gsm, n_ff_sh, T) || !frt_f32_rows(umm, n_ff_sh, T) ||
+        !frt_f32_rows(glu, n_ff_sh, T) || !frt_f32_rows(dmm, n_embd, T) || !frt_f32_rows(resid, n_embd, T) || !frt_f32_rows(lo, n_embd, T) ||
+        !frt_f32_rows(moe_out, n_embd, T)) return false;
+    // ggml would route these GEMMs to MMQ: same kernels as stock
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    for (const ggml_tensor * mm : { gmm, umm, dmm }) {
+        if (ggml_cuda_should_use_mmvq(mm->src[0]->type, cc, mm->src[1]->ne[1]) ||
+            !ggml_cuda_should_use_mmq(mm->src[0]->type, cc, mm->src[1]->ne[1], 0)) return false;
+    }
+    // every node except the window's last output is consumed inside the window
+    if (!frt_span_closed(cgraph, i, i + 24, {})) return false;
+    // buffer reuse (stock lifetimes): gate written into gate_s's buffer, up into its own; element-wise
+    // outputs may alias their inputs exactly but must not partially overlap them
+    auto bad_alias = [](const ggml_tensor * p, const ggml_tensor * q) { return p->data != q->data && frt_overlap(p, q); };
+    if (frt_overlap(gsm, umm) || frt_overlap(gsm, act) || frt_overlap(umm, act)) return false;
+    if (bad_alias(glu, gsm) || bad_alias(glu, umm)) return false;
+    if (bad_alias(lo, dmm) || bad_alias(lo, resid) || frt_overlap(dmm, glu)) return false;
+
+    cudaStream_t stream = ctx.stream();
+    static const bool check = getenv("FRT_PF_CHECK") && getenv("FRT_PF_CHECK")[0] == '1';
+    float * out_ptr = (float *) lo->data;
+    // shared-expert intermediates: graph buffers (lifetime-checked above) or, in check mode, private ones
+    float * pg = (float *) gsm->data, * pu = (float *) umm->data, * pglu = (float *) glu->data, * pd = (float *) dmm->data;
+    if (check) {
+        if (g_pf_chk.mine_out == nullptr) {
+            const size_t nb_e = (size_t) FRT_PF_TOKENS_MAX * FRT_K_EMBD * sizeof(float), nb_f = (size_t) FRT_PF_TOKENS_MAX * 1024 * sizeof(float);
+            CUDA_CHECK(cudaMalloc(&g_pf_chk.mine_out, nb_e));
+            CUDA_CHECK(cudaMalloc(&g_pf_chk.pd, nb_e));
+            CUDA_CHECK(cudaMalloc(&g_pf_chk.pg, nb_f));
+            CUDA_CHECK(cudaMalloc(&g_pf_chk.pu, nb_f));
+            CUDA_CHECK(cudaMalloc(&g_pf_chk.pglu, nb_f));
+        }
+        GGML_ASSERT(n_ff_sh <= 1024);
+        out_ptr = g_pf_chk.mine_out;
+        pg = g_pf_chk.pg; pu = g_pf_chk.pu; pglu = g_pf_chk.pglu; pd = g_pf_chk.pd;
+    }
+    {   // routed sum -> private buffer
+        const dim3 grid((unsigned) (n_embd / 256), (unsigned) T);
+        frt_pf_moe_sum<6><<<grid, 256, 0, stream>>>((const float *) x->data, (const int32_t *) ids->data, (int64_t) (ids->nb[1] / sizeof(int32_t)),
+            (const float *) sc->data, (const float *) ev->data, (const float *) wv->data, g_pf_moe, (int) n_embd);
+    }
+    ggml_tensor gate_dst = *gmm;   // gate GEMM writes into gate_s's buffer (live until the GLU)
+    gate_dst.data = pg;
+    ggml_cuda_mul_mat_q(ctx, gmm->src[0], act, nullptr, &gate_dst);
+    ggml_tensor up_dst = *umm;
+    up_dst.data = pu;
+    ggml_cuda_mul_mat_q(ctx, umm->src[0], act, nullptr, &up_dst);
+    {
+        const int64_t ne = n_ff_sh * T;
+        frt_pf_glu<<<(unsigned) ((ne + 255) / 256), 256, 0, stream>>>(pg, pu, (const float *) sg->data, (const float *) su->data, pglu, ne);
+    }
+    ggml_tensor glu_src = *glu;
+    glu_src.data = pglu;
+    ggml_tensor down_dst = *dmm;
+    down_dst.data = pd;
+    ggml_cuda_mul_mat_q(ctx, dmm->src[0], &glu_src, nullptr, &down_dst);
+    {
+        const int64_t ne = n_embd * T;
+        frt_pf_out<<<(unsigned) ((ne + 255) / 256), 256, 0, stream>>>(g_pf_moe, pd, (const float *) sd->data,
+            (const float *) resid->data, out_ptr, ne);
+    }
+    if (check) {   // ggml recomputes the span; compared at the next node
+        g_pf_chk.lo = lo;
+        g_pf_chk.n = n_embd * T;
+        return false;
+    }
+    *skip_count = 25;
     return true;
 }
 
@@ -2416,6 +2611,23 @@ static bool frt_attndec_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
 
 // ---- entry points called from the host's ggml-cuda.cu ---------------------
 
+static void frt_pf_check_compare(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (g_pf_chk.lo == nullptr || cgraph->nodes[i] == g_pf_chk.lo) return;
+    // first node after the span: ggml has computed moe_out and lo
+    bool past = false;
+    for (int j = i - 1; j >= 0 && j >= i - 4; --j) past |= cgraph->nodes[j] == g_pf_chk.lo;
+    if (!past) return;
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    const int64_t n = g_pf_chk.n;
+    std::vector<float> a(n), b(n);
+    CUDA_CHECK(cudaMemcpy(a.data(), g_pf_chk.lo->data, n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b.data(), g_pf_chk.mine_out, n * sizeof(float), cudaMemcpyDeviceToHost));
+    int64_t dl = 0;
+    for (int64_t k = 0; k < n; ++k) { dl += a[k] != b[k]; }
+    fprintf(stderr, "frt-pf-check %s: l_out differs %lld / %lld\n", g_pf_chk.lo->name, (long long) dl, (long long) n);
+    g_pf_chk.lo = nullptr;
+}
+
 bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
     if (!frt_layer_enabled()) return false;
     static const bool cc_ok = ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL;
@@ -2424,6 +2636,8 @@ bool ggml_cuda_frt_flint_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     if (frt_route_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_denseffn_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_lmhead_try(ctx, cgraph, i, skip_count)) return true;
+    if (g_pf_chk.lo) frt_pf_check_compare(ctx, cgraph, i);
+    if (frt_moetailpf_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_oproj_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_attndec_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_moeffn_try(ctx, cgraph, i, skip_count)) return true;
@@ -2440,6 +2654,7 @@ void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
         CUDA_CHECK(cudaMalloc(&g_qkv, FRT_QKV_ROWS_MAX * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_dense_glu, FRT_DFF * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_lm_q8, (FRT_K_EMBD / QK8_1) * sizeof(block_q8_1)));
+        CUDA_CHECK(cudaMalloc(&g_pf_moe, (size_t) FRT_PF_TOKENS_MAX * FRT_K_EMBD * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_route_logits, 256 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_route_count, sizeof(unsigned int)));
         CUDA_CHECK(cudaMemset(g_route_count, 0, sizeof(unsigned int)));
