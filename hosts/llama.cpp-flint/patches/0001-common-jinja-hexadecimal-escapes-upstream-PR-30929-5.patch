@@ -1,7 +1,7 @@
 From e9babd37f68ad7d0808622e3e9c6b02060487eb5 Mon Sep 17 00:00:00 2001
 From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Wed, 21 Oct 2026 15:17:11 -0400
-Subject: [PATCH 1/7] common/jinja: hexadecimal escapes (upstream PR 30929
+Subject: [PATCH 1/8] common/jinja: hexadecimal escapes (upstream PR 30929
  @532e4e78)
 
 ---

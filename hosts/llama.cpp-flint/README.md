@@ -23,8 +23,12 @@ patch series in `patches/`:
    depends on `-ub`, which sizes the sliding-window ring.
 7. The reused rows of the KQ mask are filled in parallel
    (`LLAMA_KQ_MASK_SERIAL=1` restores the serial fill).
+8. A scheduler re-reserve that keeps the node budget reuses the scheduler
+   and its compute buffers. The server sets a backend sampler per request
+   (`--backend-sampling`), which used to reallocate every compute buffer
+   before each prompt (`LLAMA_SCHED_RESERVE_NEW=1` restores that).
 
-Patches 3–7 change no values: every patch keeps logits bit-identical.
+Patches 3–8 change no values: every patch keeps logits bit-identical.
 
 `build.sh <work dir> [llama.cpp url or local clone]` reproduces the build
 from scratch: clone, fetch the PR head, check out the pin, `git am` the
@@ -76,6 +80,11 @@ server's `prompt_n`), 128 (≤32K) or 256 (64K/100K) decode tokens:
 | 65,523 | 11.9 s | 7.28 s | 5.83 s | 287 |
 | 99,994 | 20.9 s | 13.1 s | 10.9 s | 241 |
 
+With `--backend-sampling` (same session, FlashRT `-ub 4096`): time to
+first token unchanged (1K 0.12 s, 8K 0.56 s, 32K 2.38 s; 0.25 / 0.69 /
+2.51 s without patch 0008), decode 469 → 500 (1K), 412 → 452 (8K),
+348 → 361–374 (32K) tok/s, identical greedy outputs.
+
 Real-suite decode (8 coding/agent prompts, 512 greedy tokens, A/B/A):
 220.3 → 452.9 tok/s geomean (2.06x), tokens identical to stock.
 
@@ -103,6 +112,7 @@ options. Tool calls in agent prompts are well-formed in all variants.
   configuration needs an MMQ change that keeps the dense stream-k split.
 - Batched decode (2–8 concurrent requests) runs mostly stock kernels: the
   decode windows are M = 1 (batch 8: 1173 vs 948 tok/s aggregate).
-- About 0.15 ms per decoded token is host-side (token round trip, graph
-  launch); `--backend-sampling` removes part of it but re-reserves the
-  scheduler per request in this llama.cpp version.
+- Host time per decoded token (sampling, token round trip, graph launch)
+  is not overlapped with the GPU. `--backend-sampling` removes most of the
+  sampling share (served decode +5–10%, same time to first token with
+  patch 0008); the rest needs a GPU-resident decode loop.

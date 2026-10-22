@@ -1,7 +1,7 @@
 From 277d0c99c543f756adb357bd52e9b38321067850 Mon Sep 17 00:00:00 2001
 From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Wed, 21 Oct 2026 19:22:51 -0400
-Subject: [PATCH 2/7] ggml-cuda: optional FlashRT SM120 overlay
+Subject: [PATCH 2/8] ggml-cuda: optional FlashRT SM120 overlay
  (GGML_CUDA_FLASHRT_SM120)
 
 Fuse hook at the top of ggml_cuda_try_fuse and an eager pre-capture hook in

@@ -1,7 +1,7 @@
 From b400700cd22b43c16a637dd6d79daa0d6bc3410e Mon Sep 17 00:00:00 2001
 From: LiangSu8899 <7thuniversels@gmail.com>
 Date: Wed, 21 Oct 2026 19:22:51 -0400
-Subject: [PATCH 3/7] ggml-cuda: asynchronous small host->device tensor uploads
+Subject: [PATCH 3/8] ggml-cuda: asynchronous small host->device tensor uploads
 
 set_tensor of <= 64 KiB no longer blocks: the copy is issued on the
 per-thread stream and an event is recorded; graph compute, the backend

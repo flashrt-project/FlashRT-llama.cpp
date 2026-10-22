@@ -186,9 +186,13 @@ identical results either way):
 | `GGML_CUDA_MMID_SINGLE_WARP=1` | single-warp MoE id helper (stock) |
 | `GGML_CUDA_FA_KV_MIN=0` | no masked-tile skipping in the tensor-core FA kernel |
 | `LLAMA_KQ_MASK_SERIAL=1` | serial KQ-mask fill |
+| `LLAMA_SCHED_RESERVE_NEW=1` | recreate the scheduler (and its compute buffers) on every re-reserve |
 | build with `GGML_CUDA_FA_VEC_NO_MASKED_SKIP` | no masked-warp skipping in the vector FA kernel |
 
-`--backend-sampling` (stock option) speeds up decode by ~6% but, in this
-llama.cpp version, re-reserves the scheduler for every request
-(`llama_set_sampler`), which adds ~0.1 s to each request's time to first
-token at `-ub 4096`; it is not part of the recommended flags.
+`--backend-sampling` (stock option) samples on the GPU: served decode is
+5–10% faster (1K–32K prompts) and greedy outputs are unchanged; sampled
+outputs come from the GPU sampler's random stream instead of the CPU one.
+Setting a backend sampler re-reserves the scheduler for every request;
+with patch 0008 that no longer reallocates the compute buffers, so time to
+first token is the same as with CPU sampling (without it, +~0.13 s per
+request at `-ub 4096`).
