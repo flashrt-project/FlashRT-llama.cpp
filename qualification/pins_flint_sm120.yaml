@@ -1,0 +1,32 @@
+# SM120 / Recursive Flint (official NVFP4 GGUF) target: the windows in
+# fr_win_flint_sm120.cu reproduce ggml's own per-element arithmetic, so they
+# use no catalog structures; what is pinned are the model and graph shapes
+# their predicates assert (a window whose predicate fails runs stock).
+binding: llamacpp_flint_sm120
+pins: {}
+
+model_shapes:            # asserted at match time
+  n_embd: 2048
+  n_layer: 49            # layers 0-1 dense (n_ff 6144), 2-48 MoE
+  attention: {n_head: 32, n_head_kv: 4, head_dim: 128, sliding_window: 513, qk_norm: true, sinks: true,
+              rope: sliding_layers_only}
+  moe: {n_expert: 256, n_expert_used: 6, gating: sigmoid, expert_ff: 512, shared_expert_ff: 1024, shared_gated: false,
+        activation_rescale: amax_pow2_chain}
+  weights: nvfp4          # per-tensor f32 scale nodes after every NVFP4 matmul
+  router: bf16
+  kv_cache: f16
+  prefill_window_ubatch_max: 8192
+
+# Shipping gates (RTX 5090, host PIN in hosts/llama.cpp-flint, 2026-10-21):
+gates:
+  quality:
+    decode_logits_vs_stock: bit_identical       # teacher-forced n_batch 1: 1024 positions (mixed text),
+                                                # ~100K positions (code corpus), 4096 positions with -ub 4096
+    prefill_logits_vs_stock: bit_identical      # 8192 tokens at -ub 2048 and -ub 4096
+    real_suite_tokens_vs_stock: identical       # 8 coding/agent prompts, 512 greedy tokens
+    attndec_opt_in: {per_call_rel_err_max: 3.9e-6, kld_code_c2048: 0.236, stock_path_kld_reference: 0.239}
+  perf:                  # llama-bench, f16 KV, -fa on
+    tg128_d0: 550.2
+    tg128_d100k: 265.3
+    pp8192_ub4096: 16484
+    stock_reference: {tg128_d0: 242.5, tg128_d100k: 151.8, pp8192_ub512: 7236, pp8192_ub4096: 12000}
